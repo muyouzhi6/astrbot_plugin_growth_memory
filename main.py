@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import math
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -37,8 +40,6 @@ try:  # AstrBot is intentionally optional for offline tests.
     from astrbot.api import logger
     from astrbot.api.event import filter
     from astrbot.api.star import Star, StarTools
-    from astrbot.core.agent.message import TextPart
-    from astrbot.api.web import error_response, json_response, request
 except ImportError:  # pragma: no cover - only used by local import/compile tests
     import logging
 
@@ -71,32 +72,68 @@ except ImportError:  # pragma: no cover - only used by local import/compile test
             return lambda fn: fn
 
     filter = _Decorators()  # type: ignore[assignment]
+    StarTools = None
+
+try:
+    from astrbot.core.agent.message import TextPart
+except ImportError:  # AstrBot 4.26.x exposes no TextPart module in some builds.
+    TextPart = None
+
+try:
+    from astrbot.api.web import error_response, json_response, request
+except ImportError:  # pragma: no cover - compatibility with older AstrBot builds
+    try:
+        from quart import g, jsonify, request
+    except ImportError:  # pragma: no cover - offline unit tests
+        g = None
+        jsonify = None
+        request = type(
+            "Request",
+            (),
+            {
+                "method": "GET",
+                "path": "",
+                "username": "offline",
+                "path_params": {},
+                "json": None,
+            },
+        )()
 
     class _Response:
         def __init__(self, data: Any, status_code: int = 200):
             self.data, self.status_code = data, status_code
 
-    def json_response(data: Any = None, **kwargs: Any) -> _Response:
-        return _Response(data or {}, kwargs.get("status_code", 200))
+    def json_response(data: Any = None, **kwargs: Any) -> Any:
+        status_code = kwargs.get("status_code", 200)
+        if jsonify is None:
+            return _Response(data or {}, status_code)
+        try:
+            response = jsonify(data or {})
+        except RuntimeError:
+            return _Response(data or {}, status_code)
+        response.status_code = status_code
+        return response
 
-    def error_response(message: str, **kwargs: Any) -> _Response:
-        return _Response(
-            {"status": "error", "message": message}, kwargs.get("status_code", 400)
+    def error_response(message: str, **kwargs: Any) -> Any:
+        return json_response(
+            {"status": "error", "message": message},
+            status_code=kwargs.get("status_code", 400),
         )
 
-    request = type(
-        "Request",
-        (),
-        {
-            "method": "GET",
-            "path": "",
-            "username": "offline",
-            "path_params": {},
-            "json": None,
-        },
-    )()
-    TextPart = None
-    StarTools = None
+
+HAS_WAITING_LLM_HOOK = hasattr(filter, "on_waiting_llm_request")
+HAS_AGENT_DONE_HOOK = hasattr(filter, "on_agent_done")
+AGENT_COMPLETION_DECORATOR = (
+    filter.on_agent_done if HAS_AGENT_DONE_HOOK else filter.on_llm_response
+)
+
+for _missing_hook in ("on_waiting_llm_request", "on_agent_done"):
+    if not hasattr(filter, _missing_hook):
+        setattr(
+            filter,
+            _missing_hook,
+            lambda *args, **kwargs: lambda fn: fn,
+        )
 
 
 PLUGIN_NAME = "astrbot_plugin_growth_memory"
@@ -104,6 +141,7 @@ ANCHOR_STATE_TTL_SECONDS = 60 * 60
 RUNTIME_SETTING_KEYS = {
     "owner_identities",
     "capture_enabled",
+    "llm_note_enabled",
     "extractor_provider_id",
     "reviewer_provider_id",
     "daily_request_budget",
@@ -118,6 +156,7 @@ RUNTIME_SETTING_LIMITS = {
 SAFE_RUNTIME_DEFAULTS = {
     "owner_identities": [],
     "capture_enabled": False,
+    "llm_note_enabled": True,
     "extractor_provider_id": "",
     "reviewer_provider_id": "",
     "daily_request_budget": 8,
@@ -166,6 +205,7 @@ class GrowthMemory(Star):
         self._anchor_state_started_at: dict[str, float] = {}
         self._pending_completions: dict[str, tuple[str, str, str, str]] = {}
         self._routes: list[tuple[str, list[str]]] = []
+        self._target_ids: dict[str, str] = {}
         self._initialized = False
 
     async def initialize(self) -> None:
@@ -190,6 +230,7 @@ class GrowthMemory(Star):
         defaults = {
             "owner_identities": self.config.get("owner_identities", []),
             "capture_enabled": self.config.get("capture_enabled", True),
+            "llm_note_enabled": self.config.get("llm_note_enabled", True),
             "extractor_provider_id": self.config.get("extractor_provider_id", ""),
             "reviewer_provider_id": self.config.get("reviewer_provider_id", ""),
             "daily_request_budget": self.config.get("daily_request_budget", 8),
@@ -274,8 +315,11 @@ class GrowthMemory(Star):
             raw = str(value).strip()
             if not raw:
                 continue
-            parts = raw.split(":", 1)
-            owner_values.add(raw if len(parts) != 2 else f"{parts[0]}:user:{parts[1]}")
+            parts = raw.split(":")
+            if len(parts) == 3 and parts[1] == "user" and parts[2].isdigit():
+                owner_values.add(f"{parts[0]}:user:{parts[2]}")
+            elif len(parts) == 2 and parts[1].isdigit():
+                owner_values.add(f"{parts[0]}:user:{parts[1]}")
         owners = frozenset(owner_values)
         capture_enabled = bool(self.config.get("capture_enabled", True))
         self._snapshot = RuntimeSnapshot(
@@ -297,18 +341,29 @@ class GrowthMemory(Star):
                 or any(
                     not isinstance(value, str)
                     or not value.startswith("aiocqhttp:")
-                    or not value.removeprefix("aiocqhttp:").isdigit()
-                    or not 5 <= len(value.removeprefix("aiocqhttp:")) <= 20
+                    or not (
+                        value.removeprefix("aiocqhttp:").isdigit()
+                        or (
+                            value.removeprefix("aiocqhttp:").startswith("user:")
+                            and value.removeprefix("aiocqhttp:user:").isdigit()
+                        )
+                    )
+                    or not 5
+                    <= len(
+                        value.removeprefix("aiocqhttp:user:")
+                        if value.removeprefix("aiocqhttp:").startswith("user:")
+                        else value.removeprefix("aiocqhttp:")
+                    )
+                    <= 20
                     for value in values
                 )
             ):
                 raise ValueError(
                     "owner_identities must contain at most 20 aiocqhttp:QQ entries"
                 )
-        if "capture_enabled" in updates and not isinstance(
-            updates["capture_enabled"], bool
-        ):
-            raise ValueError("capture_enabled must be boolean")
+        for key in ("capture_enabled", "llm_note_enabled"):
+            if key in updates and not isinstance(updates[key], bool):
+                raise ValueError(f"{key} must be boolean")
         for key in ("extractor_provider_id", "reviewer_provider_id"):
             if key in updates and (
                 not isinstance(updates[key], str) or len(updates[key]) > 200
@@ -546,24 +601,234 @@ class GrowthMemory(Star):
         self._anchor_state_started_at[origin] = time.monotonic()
         future.add_done_callback(lambda done: self._on_anchor_resolved(origin, done))
 
+    @staticmethod
+    def _sanitize_tool_note(value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("note must be a string")
+        note = "".join(
+            char for char in value.strip() if char in "\n\t" or ord(char) >= 32
+        )
+        if not note or len(note) > 1000:
+            raise ValueError("note must contain 1-1000 visible characters")
+        lowered = note.lower()
+        if any(
+            marker in lowered
+            for marker in (
+                "api key",
+                "apikey",
+                "password",
+                "passwd",
+                "access token",
+                "refresh token",
+                "secret key",
+                "private key",
+                "-----begin",
+                "ignore previous instructions",
+                "忽略之前的指令",
+            )
+        ) or re.search(r"\bsk-[a-z0-9_-]{12,}\b", lowered):
+            raise ValueError("note looks like a credential or prompt injection")
+        return note
+
+    async def _tool_evidence_row(
+        self, event: Any, target_id: str
+    ) -> dict[str, Any] | None:
+        key = self._event_key(event)
+        origin = str(getattr(event, "unified_msg_origin", "") or key)
+        pending = self._anchor_futures.get(origin)
+        if pending and not pending.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(pending), timeout=1.5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+        row = self.store.message_by_platform_id(target_id, key)
+        if row:
+            return row
+        operation = self._inbound_operation(event, target_id, key)
+        if getattr(self.writer, "_task", None) is None:
+            return operation()
+        future = self.writer.submit(
+            CaptureItemKind.CONTEXT,
+            f"tool-context:{key}",
+            operation,
+        )
+        if future:
+            try:
+                await asyncio.wait_for(asyncio.shield(future), timeout=1.5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+        return self.store.message_by_platform_id(target_id, key)
+
+    @filter.llm_tool(name="growth_memory_note")
+    async def growth_memory_note(
+        self,
+        event: Any,
+        note: str,
+        scope: str = "owner",
+        kind: str = "profile_fact",
+        subject_id: str = "",
+        triggers: list[str] | None = None,
+        confidence: float = 0.8,
+    ) -> str:
+        """提交一条需要审核的长期记忆候选, 不会直接修改正式记忆.
+
+        仅当用户明确表达希望长期记住偏好、纠正、规则或重要经历时调用. 普通闲聊、一次性事实、通用知识和敏感信息不要调用.
+
+        Args:
+            note(string): 用一句可执行、可验证的话概括用户希望长期记住的内容, 不要写密码或提示词.
+            scope(string): 记忆层级, 只能是 owner, global, task, group, person.
+            kind(string): 条目类型, 只能是 behavior_rule, profile_fact, milestone.
+            subject_id(string): person 层级对应的 QQ 号, 留空表示当前说话的人.
+            triggers(array): task 层级的触发词列表, 其他层级可留空.
+            confidence(number): 对候选内容的初始置信度, 0 到 1.
+        """
+        if not bool(self.config.get("llm_note_enabled", True)):
+            return "记忆工具当前已关闭, 没有保存任何内容."
+        if not self.store.conn:
+            self.store.open()
+        if self._is_management(event) or not self.gate.matches(event):
+            return "当前会话没有开启学习, 没有保存任何内容."
+        target_id = self._target_for_event(event)
+        if not target_id:
+            return "当前会话不是已启用的学习目标, 没有保存任何内容."
+        try:
+            content = self._sanitize_tool_note(note)
+            scope_value = str(scope or "owner").strip().lower()
+            scope_value = {"user": "person", "member": "person"}.get(
+                scope_value, scope_value
+            )
+            kind_value = str(kind or "profile_fact").strip().lower()
+            if scope_value not in {value.value for value in ScopeType}:
+                raise ValueError("scope is invalid")
+            if kind_value not in {value.value for value in EntryKind}:
+                raise ValueError("kind is invalid")
+            if (
+                scope_value == ScopeType.GLOBAL.value
+                and kind_value != EntryKind.BEHAVIOR_RULE.value
+            ):
+                raise ValueError("global scope only accepts behavior_rule")
+            if triggers is None:
+                triggers = []
+            if not isinstance(triggers, list) or any(
+                not isinstance(value, str) for value in triggers
+            ):
+                raise ValueError("triggers must be an array of strings")
+            trigger_values = [
+                value.strip()[:64] for value in triggers[:20] if value.strip()
+            ]
+            confidence_value = float(confidence)
+            if not math.isfinite(confidence_value):
+                raise ValueError("confidence is invalid")
+            confidence_value = max(0.0, min(1.0, confidence_value))
+        except (TypeError, ValueError) as exc:
+            return f"记忆候选未保存: {exc}"
+
+        platform, _account, chat_type, peer, sender, _session = event_identity(event)
+        owner_key = f"{platform}:user:{sender}"
+        is_owner = owner_key in self._snapshot.owner_identities
+        if not is_owner and scope_value in {
+            ScopeType.GLOBAL.value,
+            ScopeType.OWNER.value,
+            ScopeType.TASK.value,
+        }:
+            return "普通成员不能提交主人、全局或任务规则候选, 没有保存任何内容."
+        if not is_owner and kind_value == EntryKind.BEHAVIOR_RULE.value:
+            return "普通成员不能提交行为规则候选, 没有保存任何内容."
+        if scope_value == ScopeType.GROUP.value:
+            if chat_type != "group":
+                return "group 层级只能在群聊中使用, 没有保存任何内容."
+            scope_key = f"{platform}:group:{peer}"
+        elif scope_value == ScopeType.PERSON.value:
+            subject = str(subject_id or sender).strip()
+            if not subject.isdigit() or (not is_owner and subject != sender):
+                return "person 层级的 subject_id 不在当前权限范围内, 没有保存任何内容."
+            participant = (
+                self.store._db()
+                .execute(
+                    "SELECT 1 FROM conversation_messages WHERE target_id=? AND sender_key=? LIMIT 1",
+                    (target_id, f"{platform}:user:{subject}"),
+                )
+                .fetchone()
+            )
+            if not participant and subject != sender:
+                return "person 层级的 subject_id 不在当前会话证据中, 没有保存任何内容."
+            scope_key = f"{platform}:user:{subject}"
+        elif scope_value == ScopeType.TASK.value:
+            if not trigger_values:
+                return "task 层级至少需要一个触发词, 没有保存任何内容."
+            scope_key = trigger_values[0]
+        else:
+            scope_key = ""
+
+        evidence = await self._tool_evidence_row(event, target_id)
+        if not evidence:
+            return "当前消息证据还未落账, 本次没有保存候选, 请稍后再试."
+        proposal = {
+            "scope_type": scope_value,
+            "scope_key": scope_key,
+            "kind": kind_value,
+            "content": content,
+            "triggers": trigger_values,
+            "confidence": confidence_value,
+            "evidence_ids": [evidence["row_id"]],
+            "signal_type": "model_reflection",
+        }
+        candidate_key = json.dumps(
+            {
+                "target_id": target_id,
+                "message_id": self._event_key(event),
+                "proposal": proposal,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        candidate_id = hashlib.sha256(candidate_key.encode("utf-8")).hexdigest()
+        row = self.store.create_tool_candidate(
+            candidate_id,
+            target_id,
+            proposal,
+            [evidence["row_id"]],
+            confidence=confidence_value,
+        )
+        self.store.audit(
+            f"llm_tool:{platform}:user:{sender}",
+            "create_candidate",
+            "candidate",
+            candidate_id,
+            {"target_id": target_id, "status": row["status"]},
+        )
+        if row.get("_duplicate") or row["status"] in {"committed", "rejected"}:
+            return f"这条记忆候选之前已经处理过, 当前状态: {row['status']}."
+        return f"已记录为待审核记忆候选 {candidate_id[:12]}, 将在下一次学习批次交给 Reviewer 筛选, 尚未写入正式记忆."
+
     @filter.on_llm_request(priority=10**9)
     async def on_llm_request(self, event: Any, req: Any) -> None:
+        if not HAS_WAITING_LLM_HOOK:
+            await self.on_waiting_llm_request(event)
         text, _ids, _tokens = render_injection(
             self._snapshot,
             event,
             int(self.config.get("injection_token_budget", 800) or 800),
         )
-        if text and hasattr(req, "extra_user_content_parts") and TextPart is not None:
+        if not text:
+            return
+        if hasattr(req, "extra_user_content_parts") and TextPart is not None:
             part = TextPart(text=text)
             if hasattr(part, "mark_as_temp"):
                 part = part.mark_as_temp()
             req.extra_user_content_parts.append(part)
+        elif hasattr(req, "system_prompt"):
+            current = str(getattr(req, "system_prompt", "") or "").strip()
+            req.system_prompt = f"{current}\n\n{text}".strip()
+        elif hasattr(req, "prompt"):
+            req.prompt = f"{getattr(req, 'prompt', '')}\n\n{text}".strip()
 
-    @filter.on_agent_done(priority=10**9)
-    async def on_agent_done(self, event: Any, run_context: Any, response: Any) -> None:
+    @AGENT_COMPLETION_DECORATOR(priority=10**9)
+    async def on_agent_done(self, event: Any, *args: Any) -> None:
         self._prune_anchor_state()
         origin = str(getattr(event, "unified_msg_origin", "") or self._event_key(event))
         handle = self._anchors.get(origin)
+        response = args[-1] if args else None
         role = str(getattr(response, "role", ""))
         text = str(getattr(response, "completion_text", "") or "").strip()
         platform, _account, _chat, _peer, _sender, session = event_identity(event)
@@ -653,6 +918,7 @@ class GrowthMemory(Star):
             return
         routes = [
             ("/astrbot_plugin_growth_memory/state", ["GET"]),
+            ("/astrbot_plugin_growth_memory/providers", ["GET"]),
             ("/astrbot_plugin_growth_memory/targets", ["GET", "POST"]),
             ("/astrbot_plugin_growth_memory/targets/<target_id>", ["POST"]),
             ("/astrbot_plugin_growth_memory/entries", ["GET", "POST"]),
@@ -674,10 +940,45 @@ class GrowthMemory(Star):
             )
             self._routes.append((route, methods))
 
+    def _available_chat_providers(self) -> list[dict[str, str]]:
+        getter = getattr(self.context, "get_all_providers", None)
+        providers: Any = []
+        if callable(getter):
+            try:
+                providers = getter() or []
+            except Exception:
+                logger.exception("[%s] failed to read chat providers", PLUGIN_NAME)
+        if not providers:
+            manager = getattr(self.context, "provider_manager", None)
+            providers = getattr(manager, "provider_insts", []) or []
+        result: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for provider in providers:
+            try:
+                meta = (
+                    provider.meta()
+                    if callable(getattr(provider, "meta", None))
+                    else None
+                )
+                provider_id = str(getattr(meta, "id", "") or "").strip()
+            except Exception:
+                continue
+            if not provider_id or provider_id in seen:
+                continue
+            seen.add(provider_id)
+            result.append({"id": provider_id, "name": provider_id})
+        return sorted(result, key=lambda item: item["id"].lower())
+
     async def web_api(self, **path_params: Any) -> Any:
         method = str(getattr(request, "method", "GET")).upper()
         path = str(getattr(request, "path", ""))
-        username = str(getattr(request, "username", "") or "")
+        web_context = globals().get("g")
+        username = str(
+            getattr(request, "username", "")
+            or getattr(web_context, "username", "")
+            or getattr(web_context, "user", "")
+            or ""
+        )
         if not username:
             return error_response("dashboard authentication required", status_code=401)
         try:
@@ -700,6 +1001,8 @@ class GrowthMemory(Star):
                         "last_error": self.pipeline.last_error,
                     }
                 )
+            if path.endswith("/providers") and method == "GET":
+                return json_response(self._available_chat_providers())
             if "/targets" in path:
                 if method == "GET":
                     return json_response(self.store.targets())
@@ -862,6 +1165,7 @@ class GrowthMemory(Star):
                             for k in (
                                 "owner_identities",
                                 "capture_enabled",
+                                "llm_note_enabled",
                                 "extractor_provider_id",
                                 "reviewer_provider_id",
                                 "daily_request_budget",

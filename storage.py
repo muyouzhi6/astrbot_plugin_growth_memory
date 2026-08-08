@@ -65,7 +65,9 @@ CREATE TABLE IF NOT EXISTS evidence(
 CREATE TABLE IF NOT EXISTS candidates(
  candidate_id TEXT PRIMARY KEY, run_id TEXT, target_id TEXT, proposal_json TEXT NOT NULL,
  status TEXT NOT NULL DEFAULT 'pending', confidence REAL NOT NULL DEFAULT 0,
- proposed_by TEXT NOT NULL, rejection_reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+ proposed_by TEXT NOT NULL, rejection_reason TEXT NOT NULL DEFAULT '',
+ attempts INTEGER NOT NULL DEFAULT 0, review_lease_until TEXT, review_run_id TEXT,
+ last_error_code TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS candidate_evidence(candidate_id TEXT NOT NULL,evidence_id TEXT NOT NULL,PRIMARY KEY(candidate_id,evidence_id));
 CREATE TABLE IF NOT EXISTS learning_schedules(
  schedule_id TEXT PRIMARY KEY, timezone TEXT NOT NULL, local_time TEXT NOT NULL,
@@ -145,6 +147,20 @@ class GrowthStore:
             self.conn.execute(
                 "ALTER TABLE entries ADD COLUMN evidence_dates_json TEXT NOT NULL DEFAULT '[]'"
             )
+        candidate_columns = {
+            str(row[1])
+            for row in self.conn.execute("PRAGMA table_info(candidates)").fetchall()
+        }
+        for name, definition in (
+            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("review_lease_until", "TEXT"),
+            ("review_run_id", "TEXT"),
+            ("last_error_code", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in candidate_columns:
+                self.conn.execute(
+                    f"ALTER TABLE candidates ADD COLUMN {name} {definition}"
+                )
         self.conn.commit()
 
     def close(self) -> None:
@@ -499,6 +515,146 @@ class GrowthStore:
             .execute(f"SELECT * FROM entries {where} ORDER BY updated_at DESC", params)
             .fetchall()
         ]
+
+    def create_tool_candidate(
+        self,
+        candidate_id: str,
+        target_id: str,
+        proposal: dict[str, Any],
+        evidence_ids: list[str],
+        *,
+        confidence: float,
+    ) -> dict[str, Any]:
+        """Persist an LLM-suggested note without activating an entry."""
+        if not candidate_id or not target_id or not isinstance(proposal, dict):
+            raise ValueError("candidate fields are invalid")
+        evidence = list(dict.fromkeys(str(value) for value in evidence_ids if value))[
+            :50
+        ]
+        if not evidence:
+            raise ValueError("candidate requires evidence")
+        with self._lock:
+            db = self._db()
+            stamp = now_iso()
+            existing = db.execute(
+                "SELECT 1 FROM candidates WHERE candidate_id=?", (candidate_id,)
+            ).fetchone()
+            db.execute(
+                "INSERT OR IGNORE INTO candidates(candidate_id,run_id,target_id,proposal_json,status,confidence,proposed_by,rejection_reason,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    candidate_id,
+                    None,
+                    target_id,
+                    json.dumps(proposal, ensure_ascii=False),
+                    "pending",
+                    max(0.0, min(1.0, float(confidence))),
+                    "llm_tool",
+                    "",
+                    stamp,
+                    stamp,
+                ),
+            )
+            db.executemany(
+                "INSERT OR IGNORE INTO candidate_evidence(candidate_id,evidence_id) VALUES(?,?)",
+                [(candidate_id, value) for value in evidence],
+            )
+            db.commit()
+            row = db.execute(
+                "SELECT * FROM candidates WHERE candidate_id=?", (candidate_id,)
+            ).fetchone()
+            if not row:
+                raise RuntimeError("candidate persistence failed")
+            result = dict(row)
+            result["_duplicate"] = bool(existing)
+            return result
+
+    def pending_tool_candidate_count(self) -> int:
+        return int(
+            self._db()
+            .execute(
+                "SELECT COUNT(*) FROM candidates WHERE proposed_by='llm_tool' AND status IN ('pending','deferred')"
+            )
+            .fetchone()[0]
+        )
+
+    def claim_tool_candidates(
+        self, run_id: str, *, limit: int = 20, lease_seconds: int = 300
+    ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        with self._lock:
+            db = self._db()
+            stamp = now_iso()
+            db.execute(
+                "UPDATE candidates SET status='pending',review_lease_until=NULL,review_run_id=NULL,updated_at=? "
+                "WHERE proposed_by='llm_tool' AND status='reviewing' AND review_lease_until IS NOT NULL AND review_lease_until<=?",
+                (stamp, stamp),
+            )
+            rows = db.execute(
+                "SELECT * FROM candidates WHERE proposed_by='llm_tool' AND status IN ('pending','deferred') "
+                "ORDER BY created_at LIMIT ?",
+                (limit,),
+            ).fetchall()
+            if not rows:
+                db.commit()
+                return []
+            lease_until = (
+                datetime.now(timezone.utc) + timedelta(seconds=max(30, lease_seconds))
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            ids = [str(row["candidate_id"]) for row in rows]
+            db.executemany(
+                "UPDATE candidates SET status='reviewing',attempts=attempts+1,review_lease_until=?,review_run_id=?,updated_at=? "
+                "WHERE candidate_id=? AND proposed_by='llm_tool' AND status IN ('pending','deferred')",
+                [(lease_until, run_id, stamp, candidate_id) for candidate_id in ids],
+            )
+            db.commit()
+            claimed = db.execute(
+                "SELECT * FROM candidates WHERE review_run_id=? AND status='reviewing' ORDER BY created_at",
+                (run_id,),
+            ).fetchall()
+            return [dict(row) for row in claimed]
+
+    def candidate_evidence_ids(self, candidate_id: str) -> list[str]:
+        return [
+            str(row[0])
+            for row in self._db()
+            .execute(
+                "SELECT evidence_id FROM candidate_evidence WHERE candidate_id=? ORDER BY evidence_id",
+                (candidate_id,),
+            )
+            .fetchall()
+        ]
+
+    def finish_tool_candidate(
+        self,
+        candidate_id: str,
+        run_id: str,
+        status: str,
+        *,
+        reason: str = "",
+    ) -> bool:
+        if status not in {"committed", "rejected", "deferred"}:
+            raise ValueError("invalid candidate status")
+        with self._lock:
+            updated = (
+                self._db()
+                .execute(
+                    "UPDATE candidates SET status=?,rejection_reason=?,last_error_code=?,review_lease_until=NULL,updated_at=? "
+                    "WHERE candidate_id=? AND proposed_by='llm_tool' AND status='reviewing' AND review_run_id=?",
+                    (
+                        status,
+                        reason[:400],
+                        reason[:120] if status == "deferred" else "",
+                        now_iso(),
+                        candidate_id,
+                        run_id,
+                    ),
+                )
+                .rowcount
+            )
+            self._db().commit()
+            return bool(updated)
 
     def entry_versions(self, entry_id: str) -> list[dict[str, Any]]:
         return [
@@ -916,4 +1072,5 @@ class GrowthStore:
                 "WHERE status IN ('open','retryable')"
             ).fetchone()[0]
         )
+        counts["pending_tool_candidates"] = self.pending_tool_candidate_count()
         return counts

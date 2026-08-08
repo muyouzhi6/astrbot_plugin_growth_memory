@@ -13,8 +13,8 @@
 - [x] 在 AstrBot `uv` 环境导入 `GrowthMemory`.
 - [x] 注册 9 个 handler.
 - [x] 确认 capture filters 顺序为 `TargetCaptureFilter -> EventMessageTypeFilter`.
-- [x] 完成 `initialize -> terminate`, 创建 12 个 Web API route, 停止 ticker, 清理 route.
-- [x] 通过 54 项 `unittest`.
+- [x] 完成 `initialize -> terminate`, 创建 13 个 Web API route, 停止 ticker, 清理 route.
+- [x] 通过 57 项 `unittest`.
 - [x] 通过 `ruff check .`.
 - [x] 通过 `ruff format --check .`.
 - [x] 通过 `python3 -m compileall -q .`.
@@ -43,11 +43,13 @@
 - [x] 验证同一插件实例重复 `initialize()` 不重复创建 writer、ticker 或 Web API route.
 - [x] 验证 Reviewer batch 数据库 compare-and-set 抢占, 并发执行同一 batch 只调用一次 Provider.
 - [x] 验证启动时非法 SQLite runtime flag 自动修复为安全默认值.
+- [x] 验证 `growth_memory_note` 已注册到 AstrBot LLM tool registry, 只写候选队列, 同一消息确定性去重, 普通成员权限拒绝和敏感内容拦截.
+- [x] 验证 `/providers` API 从 `context.get_all_providers()` 读取 Chat Provider, 去重排序, WebUI Extractor/Reviewer 下拉可恢复已保存值并标记已下线 Provider.
 - [x] 完成 2,000 条上下文和 40 个关键事件的有界 writer 压力探针, 队列清空且 SQLite 无异常.
 
 ## 京东云基础部署证据
 
-2026-08-08 已将 GitHub `main` 的 `34f067ac71b44b4c390816e81059b11bd188f4f6` 部署到 `/opt/1panel/apps/astrbot/astrbot/data/plugins/astrbot_plugin_growth_memory`, 当前为 `v0.2.3`.
+2026-08-08 已将 GitHub `main` 的 `34f067ac71b44b4c390816e81059b11bd188f4f6` 部署到 `/opt/1panel/apps/astrbot/astrbot/data/plugins/astrbot_plugin_growth_memory`, 当前为 `v0.2.3`; `v0.3.0` 的主动记忆和 Provider 下拉改动待本轮发布后追加证据.
 
 - 变更前备份: `/opt/1panel/apps/astrbot/astrbot/data/backups/astrbot_plugin_growth_memory/20260808-213108-v0.2.3-predeploy/`, 含旧插件、配置和 SQLite 在线备份.
 - 插件归档 SHA-256: `16753700be94e84638b135808c3021fec18e5b4df95e351f62efd86c56312394`.

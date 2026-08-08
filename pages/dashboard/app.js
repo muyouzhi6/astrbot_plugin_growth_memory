@@ -1,6 +1,6 @@
 const bridge = window.AstrBotPluginPage;
 const $ = (id) => document.getElementById(id);
-const state = { entries: [], schedules: [], settings: {}, pendingRequests: 0 };
+const state = { entries: [], schedules: [], settings: {}, providers: [], pendingRequests: 0 };
 
 const labels = {
   active: "生效", trial: "试用", draft: "草稿", suspended: "暂停", archived: "归档",
@@ -62,6 +62,7 @@ function renderMetrics(data) {
     ["学习目标", counts.learning_targets || 0, data.snapshot?.capture_enabled ? "捕获开关开启" : "捕获开关关闭"],
     ["原始消息", counts.conversation_messages || 0, "保留 14 天"],
     ["待处理 anchor", counts.pending_anchors ?? counts.trigger_anchors ?? 0, "问答证据"],
+    ["待审核候选", counts.pending_tool_candidates || 0, "LLM 主动记忆"],
     ["记忆条目", counts.entries || 0, "按层级注入"],
     ["学习运行", counts.learning_runs || 0, "含失败和补跑"],
     ["今日预算", budget, `${(usedBudget.input_tokens_estimated || 0).toLocaleString()}/${(settings.daily_input_token_budget ?? 16000).toLocaleString()} tok`],
@@ -112,6 +113,16 @@ function fillSettings(settings) {
   const form = $("settings-form");
   form.owner_identities.value = (settings.owner_identities || []).join("\n");
   form.capture_enabled.checked = Boolean(settings.capture_enabled);
+  form.llm_note_enabled.checked = settings.llm_note_enabled !== false;
+  const providerOptions = (selected, emptyLabel) => {
+    const options = [`<option value="">${escapeHtml(emptyLabel)}</option>`];
+    const ids = state.providers.map((item) => String(item.id || "")).filter(Boolean);
+    if (selected && !ids.includes(selected)) options.push(`<option value="${escapeHtml(selected)}">${escapeHtml(selected)} (当前不可用)</option>`);
+    options.push(...ids.map((id) => `<option value="${escapeHtml(id)}">${escapeHtml(id)}</option>`));
+    return options.join("");
+  };
+  form.extractor_provider_id.innerHTML = providerOptions(settings.extractor_provider_id || "", "不启用自动提取");
+  form.reviewer_provider_id.innerHTML = providerOptions(settings.reviewer_provider_id || "", "留空复用 Extractor");
   form.extractor_provider_id.value = settings.extractor_provider_id || "";
   form.reviewer_provider_id.value = settings.reviewer_provider_id || "";
   form.daily_request_budget.value = settings.daily_request_budget ?? 8;
@@ -120,8 +131,9 @@ function fillSettings(settings) {
 }
 
 async function load() {
-  const [dashboard, settings, entries, runs] = await Promise.all([api("GET", "state"), api("GET", "settings"), api("GET", "entries"), api("GET", "runs")]);
+  const [dashboard, settings, entries, runs, providers] = await Promise.all([api("GET", "state"), api("GET", "settings"), api("GET", "entries"), api("GET", "runs"), api("GET", "providers")]);
   state.entries = entries || [];
+  state.providers = providers || [];
   fillSettings(settings);
   renderMetrics(dashboard);
   renderTargets(dashboard.targets || []);
@@ -188,7 +200,7 @@ $("settings-form").addEventListener("submit", async (event) => {
   try {
     const form = event.target;
     const ownerIdentities = form.owner_identities.value.split(/[\n,]+/).map((item) => item.trim()).filter(Boolean);
-    await api("POST", "settings", { owner_identities: ownerIdentities, capture_enabled: form.capture_enabled.checked, extractor_provider_id: form.extractor_provider_id.value.trim(), reviewer_provider_id: form.reviewer_provider_id.value.trim(), daily_request_budget: Number(form.daily_request_budget.value), daily_input_token_budget: Number(form.daily_input_token_budget.value), injection_token_budget: Number(form.injection_token_budget.value) });
+    await api("POST", "settings", { owner_identities: ownerIdentities, capture_enabled: form.capture_enabled.checked, llm_note_enabled: form.llm_note_enabled.checked, extractor_provider_id: form.extractor_provider_id.value.trim(), reviewer_provider_id: form.reviewer_provider_id.value.trim(), daily_request_budget: Number(form.daily_request_budget.value), daily_input_token_budget: Number(form.daily_input_token_budget.value), injection_token_budget: Number(form.injection_token_budget.value) });
     showToast("运行设置已保存");
     await load();
   } catch (error) { showToast(String(error), true); }

@@ -1,5 +1,12 @@
 # 变更记录
 
+## v0.3.0
+
+- 新增 `growth_memory_note` AstrBot LLM tool. LLM 只能提交带当前入站消息证据的候选, 由 Reviewer 审核后才进入正式记忆.
+- 新增主动记忆候选开关、SQLite 候选队列、审核 lease/重试/去重和自动条目版本化更新, 人工条目不会被覆盖.
+- 总结 Provider 改为从 AstrBot 已配置 Chat Provider 动态读取, WebUI 用下拉框分别选择 Extractor 和 Reviewer, Provider 不可用时保留配置并延迟处理.
+- 兼容缺失 `on_waiting_llm_request`, `on_agent_done`, `astrbot.api.web` 和 `TextPart` 的 AstrBot 构建, 使用受限 legacy fallback.
+
 ## v0.2.3
 
 - 修复 Plugin Page 缺少 toast 节点导致所有操作反馈抛出异常的问题, 增加请求期间防重复提交、加载状态、可访问性播报和移动端操作区布局.

@@ -57,9 +57,10 @@
         <div class="panel-heading"><div><p class="kicker">CONTROL PLANE</p><h2>运行设置</h2></div><span class="hint">写入 SQLite, reload 保留</span></div>
         <form id="settings-form" class="settings-grid">
           <label class="switch-row"><input name="capture_enabled" type="checkbox" /><span><b>全局捕获开关</b><small>关闭后立即停止采集, 已有记忆仍会注入</small></span></label>
+          <label class="switch-row"><input name="llm_note_enabled" type="checkbox" /><span><b>允许 LLM 主动记候选</b><small>只进入 Reviewer 队列, 不会直接修改正式记忆</small></span></label>
           <label class="wide">主人身份 <span class="muted">每行一个 aiocqhttp:QQ号</span><textarea name="owner_identities" rows="2" placeholder="aiocqhttp:123456789"></textarea></label>
-          <label>Extractor Provider ID<input name="extractor_provider_id" placeholder="第一阶段提取模型" /></label>
-          <label>Reviewer Provider ID<input name="reviewer_provider_id" placeholder="留空复用 Extractor" /></label>
+          <label>Extractor 总结 Provider<select name="extractor_provider_id"><option value="">不启用自动提取</option></select></label>
+          <label>Reviewer 审查 Provider<select name="reviewer_provider_id"><option value="">留空复用 Extractor</option></select></label>
           <label>每日请求上限<input name="daily_request_budget" type="number" min="1" max="32" step="1" /></label>
           <label>每日输入 Token 上限<input name="daily_input_token_budget" type="number" min="2000" max="64000" step="1000" /></label>
           <label>单轮注入 Token 上限<input name="injection_token_budget" type="number" min="128" max="2400" step="64" /></label>

@@ -14,6 +14,7 @@
 - 未产生最终回答的 `missing/retryable` anchor 超过 2 小时自动取消, 防止异常或并发锁造成长期堆积.
 - 条目使用追加版本, WebUI 支持查看、编辑和回滚.
 - WebUI 可维护主人身份、学习目标和多个时间点, 展示真实预算/队列/证据天数, 支持归档和从历史版本选择回滚.
+- 总结 Provider 从 AstrBot 当前已配置的 Chat Provider 动态下拉选择, 可分别设置 Extractor 和 Reviewer; Provider 被删除或改名时保留旧值并明确标为不可用, 不会误调用其他模型.
 - Reviewer 的 trust/status 由服务端依据 owner 原话和重复证据推导, 自动学习不能改写人工条目.
 - Extractor/Reviewer 必须引用当前窗口内真实入站消息 ID; 证据按消息跨 batch 去重, 不会因重叠窗口虚增计数.
 - 自动学习写入后立即刷新内存 snapshot; 过期条目最多 5 分钟退出运行态, 90 天未确认草稿自动归档.
@@ -27,8 +28,8 @@
 首次在 AstrBot 插件配置中设置:
 
 1. `owner_identities`: 主人身份, 例如 `aiocqhttp:123456789`.
-2. `extractor_provider_id`: 第一阶段模型的 AstrBot provider ID.
-3. `reviewer_provider_id`: 审查模型 provider ID; 留空时复用 Extractor provider.
+2. 在插件 Page 的“运行设置”中从下拉列表选择 `Extractor 总结 Provider`.
+3. 可选地选择独立的 `Reviewer 审查 Provider`; 留空时复用 Extractor Provider. 下拉数据直接来自 AstrBot 当前已配置的 Chat Provider, 不需要重复填写 API Key.
 4. `capture_enabled`: 全局 kill switch. 默认 `true`, 但 target 为空时不会采集任何会话.
 
 随后在需要学习的 QQ 私聊或群聊发送 `/进化`, 或从插件详情页进入 `小本本记下来` Page 添加精确 QQ 号/群号. Plugin Page 的 target、schedule 和 runtime settings 写入 SQLite, plugin reload 后保持不变.

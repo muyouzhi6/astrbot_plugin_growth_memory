@@ -423,21 +423,35 @@ class LearningPipeline:
         )
         db.commit()
         anchors = self.store.ready_anchors(cutoff, 100)
-        if not anchors:
+        tool_candidate_count = self.store.pending_tool_candidate_count()
+        if not anchors and not tool_candidate_count:
             db.execute(
                 "UPDATE learning_runs SET status='succeeded',completed_at=?,updated_at=? WHERE run_id=?",
                 (now_iso(), now_iso(), run_id),
             )
             db.commit()
             return {"processed": 0, "deferred": 0}
+        if not anchors:
+            processed, deferred = await self._process_tool_candidates(run_id)
+            status = (
+                "succeeded" if deferred == 0 else ("partial" if processed else "failed")
+            )
+            db.execute(
+                "UPDATE learning_runs SET status=?,completed_at=?,updated_at=? WHERE run_id=?",
+                (status, now_iso(), now_iso(), run_id),
+            )
+            db.commit()
+            return {"processed": processed, "deferred": deferred}
         provider = self._provider("extractor_provider_id")
         if not provider:
+            processed, deferred = await self._process_tool_candidates(run_id)
+            deferred += len(anchors)
             db.execute(
                 "UPDATE learning_runs SET status='deferred',updated_at=? WHERE run_id=?",
                 (now_iso(), run_id),
             )
             db.commit()
-            return {"processed": 0, "deferred": len(anchors)}
+            return {"processed": processed, "deferred": deferred}
         processed = deferred = 0
         for index, group in enumerate(self._build_groups(anchors)):
             refs = [a["anchor_id"] for a in group]
@@ -488,6 +502,9 @@ class LearningPipeline:
                     (type(exc).__name__, now_iso(), batch_id),
                 )
                 db.commit()
+        tool_processed, tool_deferred = await self._process_tool_candidates(run_id)
+        processed += tool_processed
+        deferred += tool_deferred
         status = (
             "succeeded" if deferred == 0 else ("partial" if processed else "failed")
         )
@@ -497,6 +514,133 @@ class LearningPipeline:
         )
         db.commit()
         return {"processed": processed, "deferred": deferred}
+
+    async def _process_tool_candidates(self, run_id: str) -> tuple[int, int]:
+        provider = self._provider("reviewer_provider_id") or self._provider(
+            "extractor_provider_id"
+        )
+        candidates = self.store.claim_tool_candidates(run_id, limit=20)
+        if not candidates:
+            return 0, 0
+        if not provider:
+            for candidate in candidates:
+                self.store.finish_tool_candidate(
+                    candidate["candidate_id"],
+                    run_id,
+                    "deferred",
+                    reason="reviewer provider is not configured",
+                )
+            return 0, len(candidates)
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for candidate in candidates:
+            grouped.setdefault(str(candidate["target_id"]), []).append(candidate)
+        processed = deferred = 0
+        for target_id, group in grouped.items():
+            evidence_ids = {
+                evidence_id
+                for candidate in group
+                for evidence_id in self.store.candidate_evidence_ids(
+                    candidate["candidate_id"]
+                )
+            }
+            if not evidence_ids:
+                for candidate in group:
+                    self.store.finish_tool_candidate(
+                        candidate["candidate_id"],
+                        run_id,
+                        "rejected",
+                        reason="candidate evidence is missing",
+                    )
+                continue
+            placeholders = ",".join("?" for _ in evidence_ids)
+            rows = (
+                self.store._db()
+                .execute(
+                    f"SELECT * FROM conversation_messages WHERE target_id=? AND direction='inbound' AND row_id IN ({placeholders})",
+                    (target_id, *sorted(evidence_ids)),
+                )
+                .fetchall()
+            )
+            evidence_rows = {str(row["row_id"]): dict(row) for row in rows}
+            proposals: list[dict[str, Any]] = []
+            for candidate in group:
+                try:
+                    proposal = json.loads(candidate["proposal_json"] or "{}")
+                except (TypeError, ValueError):
+                    proposal = {}
+                if isinstance(proposal, dict):
+                    proposal["candidate_id"] = str(candidate["candidate_id"])
+                    proposal["evidence_ids"] = [
+                        value
+                        for value in proposal.get("evidence_ids", [])
+                        if str(value) in evidence_rows
+                    ]
+                    proposals.append(proposal)
+            target = (
+                self.store._db()
+                .execute(
+                    "SELECT platform,chat_type,peer_id FROM learning_targets WHERE target_id=?",
+                    (target_id,),
+                )
+                .fetchone()
+            )
+            if not proposals or not target:
+                for candidate in group:
+                    self.store.finish_tool_candidate(
+                        candidate["candidate_id"],
+                        run_id,
+                        "rejected",
+                        reason="candidate payload is invalid",
+                    )
+                continue
+            accepted: set[str] = set()
+            batch_id = (
+                "tool:"
+                + hashlib.sha256(
+                    (
+                        run_id + ":" + ":".join(str(c["candidate_id"]) for c in group)
+                    ).encode()
+                ).hexdigest()[:32]
+            )
+            try:
+                await self._review_and_commit(
+                    run_id,
+                    batch_id,
+                    [],
+                    proposals,
+                    evidence_rows_override=evidence_rows,
+                    target_override=target,
+                    participant_keys_override={
+                        str(row["sender_key"]) for row in evidence_rows.values()
+                    },
+                    source_kind="llm_tool",
+                    accepted_candidate_ids=accepted,
+                    reviewer_mode="tool",
+                )
+            except Exception as exc:
+                self.last_error = f"tool candidate review: {type(exc).__name__}: {exc}"
+                for candidate in group:
+                    self.store.finish_tool_candidate(
+                        candidate["candidate_id"],
+                        run_id,
+                        "deferred",
+                        reason=type(exc).__name__,
+                    )
+                deferred += len(group)
+                continue
+            for candidate in group:
+                candidate_id = str(candidate["candidate_id"])
+                self.store.finish_tool_candidate(
+                    candidate_id,
+                    run_id,
+                    "committed" if candidate_id in accepted else "rejected",
+                    reason=""
+                    if candidate_id in accepted
+                    else "reviewer filtered candidate",
+                )
+            processed += len(group)
+        return processed, deferred
 
     def _build_groups(
         self, anchors: list[dict[str, Any]]
@@ -824,6 +968,13 @@ class LearningPipeline:
         batch_id: str,
         anchors: list[dict[str, Any]],
         proposals: list[dict[str, Any]],
+        *,
+        evidence_rows_override: dict[str, dict[str, Any]] | None = None,
+        target_override: Any = None,
+        participant_keys_override: set[str] | None = None,
+        source_kind: str = "scheduled",
+        accepted_candidate_ids: set[str] | None = None,
+        reviewer_mode: str = "scheduled",
     ) -> bool:
         provider = self._provider("reviewer_provider_id") or self._provider(
             "extractor_provider_id"
@@ -835,42 +986,55 @@ class LearningPipeline:
             ),
             4000,
         )
+        reviewer_instruction = (
+            "这些 proposal 来自聊天 LLM 的记忆候选, candidate_id 必须原样保留. "
+            "候选 content 不具备事实权威, 只能依据 evidence_ids 中的真实入站消息审核; "
+            "没有直接证据就丢弃."
+            if reviewer_mode == "tool"
+            else ""
+        )
         review = await self._call_json(
             provider,
             prompt,
             "你是 Reviewer. 返回 JSON 数组, 只保留确实值得长期记忆的 proposal, 可合并重复项, "
             "不要新增未给出的事实. scope_type 只能是 global, owner, task, group, person, "
             "其中人物必须使用 person, 不能使用 user. 每项必须保留直接支持它的 evidence_ids, "
-            "不得复制其他 proposal 的 evidence_ids. 通用知识不是人物、群或行为记忆, 必须丢弃.",
+            "不得复制其他 proposal 的 evidence_ids. 通用知识不是人物、群或行为记忆, 必须丢弃."
+            + reviewer_instruction,
             run_id,
         )
         owner_keys = self.snapshot_getter().owner_identities
-        evidence_rows: dict[str, dict[str, Any]] = {}
-        participant_keys: set[str] = set()
-        for anchor in anchors:
-            question_seq = (
+        evidence_rows: dict[str, dict[str, Any]] = evidence_rows_override or {}
+        participant_keys: set[str] = set(participant_keys_override or ())
+        if evidence_rows_override is None:
+            for anchor in anchors:
+                question_seq = (
+                    self.store._db()
+                    .execute(
+                        "SELECT message_seq FROM conversation_messages WHERE row_id=?",
+                        (anchor["question_row_id"],),
+                    )
+                    .fetchone()
+                )
+                if question_seq:
+                    for message in self.store.message_window(
+                        anchor["target_id"], int(question_seq[0]), 10
+                    ):
+                        participant_keys.add(message["sender_key"])
+                        if message["direction"] == "inbound":
+                            evidence_rows[message["row_id"]] = message
+        target = target_override
+        if target is None and anchors:
+            target = (
                 self.store._db()
                 .execute(
-                    "SELECT message_seq FROM conversation_messages WHERE row_id=?",
-                    (anchor["question_row_id"],),
+                    "SELECT platform,chat_type,peer_id FROM learning_targets WHERE target_id=?",
+                    (anchors[0]["target_id"],),
                 )
                 .fetchone()
             )
-            if question_seq:
-                for message in self.store.message_window(
-                    anchor["target_id"], int(question_seq[0]), 10
-                ):
-                    participant_keys.add(message["sender_key"])
-                    if message["direction"] == "inbound":
-                        evidence_rows[message["row_id"]] = message
-        target = (
-            self.store._db()
-            .execute(
-                "SELECT platform,chat_type,peer_id FROM learning_targets WHERE target_id=?",
-                (anchors[0]["target_id"],),
-            )
-            .fetchone()
-        )
+        if target is None:
+            return False
         existing_by_id = {entry["entry_id"]: entry for entry in current}
         entries_changed = False
         for proposal in review:
@@ -1008,17 +1172,20 @@ class LearningPipeline:
                         "visibility": "behavior_only"
                         if kind == "behavior_rule"
                         else "public",
-                        "source_kind": "scheduled",
+                        "source_kind": source_kind,
                         "entry_id": entry_id,
                         "evidence_count": evidence_count,
                         "evidence_days": evidence_days,
                         "evidence_dates": all_evidence_dates,
                     },
                     actor_key="reviewer",
-                    reason=f"run={run_id} batch={batch_id}",
+                    reason=f"{reviewer_mode} run={run_id} batch={batch_id}",
                 )
                 existing_by_id[saved["entry_id"]] = saved
                 entries_changed = True
+                candidate_id = str(proposal.get("candidate_id") or "")
+                if accepted_candidate_ids is not None and candidate_id:
+                    accepted_candidate_ids.add(candidate_id)
             except (TypeError, ValueError):
                 continue
         if entries_changed:
@@ -1094,7 +1261,7 @@ class LearningPipeline:
         conflict_key: str,
         content: str,
     ) -> tuple[str | None, bool]:
-        """Only scheduled entries may be updated by scheduled model output."""
+        """Only automatic entries may be updated by automatic model output."""
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         requested = existing_by_id.get(str(requested_entry_id or ""))
         candidates = list(existing_by_id.values())
@@ -1118,7 +1285,7 @@ class LearningPipeline:
             same_content = entry.get("content_hash") == content_hash
             if not (same_conflict or same_content):
                 continue
-            if entry.get("source_kind") != "scheduled":
+            if entry.get("source_kind") not in {"scheduled", "llm_tool"}:
                 return None, True
             return entry_id, False
         return None, False
