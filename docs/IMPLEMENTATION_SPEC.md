@@ -6,7 +6,7 @@
 - 插件名: `astrbot_plugin_growth_memory`.
 - 中文名: `小本本记下来`.
 - 目标 AstrBot: 生产基线 `4.26.8`, 最低版本 `4.24.0`.
-- 当前状态: v0.2.1 已完成可加载实现、SQLite 向前迁移、版本化 WebUI 和线上短时闭环; 24 小时 soak 仍需部署后持续观察.
+- 当前状态: v0.2.2 已完成消息级证据校验与去重、SQLite 向前迁移、版本化 WebUI、snapshot 即时发布和线上短时闭环; 24 小时 soak 仍需部署后持续观察.
 - 实施原则: 先 shadow, 再 owner learning, 最后 group/person learning.
 - 自动学习执行合同: [定时学习管线规格](SCHEDULED_LEARNING_PIPELINE.md).
 

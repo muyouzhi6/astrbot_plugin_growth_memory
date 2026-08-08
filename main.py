@@ -149,6 +149,7 @@ class GrowthMemory(Star):
             self.config,
             lambda: self.gate.snapshot,
             lambda: self.capture.degraded,
+            self._refresh_snapshot,
         )
         self._snapshot = RuntimeSnapshot(TargetMatcher(capture_enabled=False))
         self._anchors: dict[str, AnchorHandle] = {}
@@ -657,7 +658,7 @@ class GrowthMemory(Star):
                         "plugin": PLUGIN_NAME,
                         "snapshot": {
                             "targets": len(self.store.targets()),
-                            "entries": len(self.store.entries()),
+                            "entries": len(self._snapshot.entries),
                             "capture_enabled": self._snapshot.capture_enabled,
                         },
                         "counts": self.store.counts(),

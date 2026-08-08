@@ -1,5 +1,14 @@
 # 变更记录
 
+## v0.2.2
+
+- 将自动 proposal 的证据改为逐条 `message_row_id` 白名单校验, trust、证据条数和证据天数只按该 proposal 实际引用的入站消息计算.
+- 新增跨 batch 的消息级证据去重, 防止重叠上下文重复累计并提前把人物或群画像提升为 `trial`.
+- 自动学习成功后立即发布新的内存 snapshot, 不再等待插件 reload 才参与后续注入.
+- 拒绝自动生成的 `global profile_fact/milestone`, 避免把普通技术问答当成跨会话长期记忆.
+- 过期条目最多 5 分钟退出运行 snapshot, 自动草稿 90 天未确认后归档; 成功恢复后清理陈旧错误告警.
+- 新增 proposal 证据隔离、global 普通知识拒绝、snapshot 即时刷新、证据去重和条目生命周期回归测试.
+
 ## v0.2.1
 
 - 修正 Extractor/Reviewer 每次尝试的请求、输入 token 和输出 token 统计, 延迟 Reviewer 成功后同步 run 状态.

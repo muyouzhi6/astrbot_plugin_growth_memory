@@ -15,6 +15,8 @@
 - 条目使用追加版本, WebUI 支持查看、编辑和回滚.
 - WebUI 可维护主人身份、学习目标和多个时间点, 展示真实预算/队列/证据天数, 支持归档和从历史版本选择回滚.
 - Reviewer 的 trust/status 由服务端依据 owner 原话和重复证据推导, 自动学习不能改写人工条目.
+- Extractor/Reviewer 必须引用当前窗口内真实入站消息 ID; 证据按消息跨 batch 去重, 不会因重叠窗口虚增计数.
+- 自动学习写入后立即刷新内存 snapshot; 过期条目最多 5 分钟退出运行态, 90 天未确认草稿自动归档.
 - 单轮注入默认最多 800 估算 token, 只使用内存 snapshot, 不在聊天热路径调用学习模型.
 - 原始消息默认保留 14 天; 未完成 anchor 的问题和答案不按普通 TTL 删除.
 
@@ -46,7 +48,7 @@ ruff format --check .
 python3 -m compileall -q .
 ```
 
-当前实现通过 45 项离线和组件集成测试, 并在 AstrBot 4.26.8 的 `uv` 环境完成真实 import、handler registry 和 `initialize -> terminate` 生命周期检查; 另完成 2,000 条上下文和 40 个关键事件的 writer 压力探针. 详细证据见 [验证记录](docs/VALIDATION.md).
+当前实现通过 50 项离线和组件集成测试, 并在 AstrBot 4.26.8 的 `uv` 环境完成真实 import、handler registry 和 `initialize -> terminate` 生命周期检查; 另完成 2,000 条上下文和 40 个关键事件的 writer 压力探针. 详细证据见 [验证记录](docs/VALIDATION.md).
 
 京东云已完成插件初始化、SQLite 完整性、受保护 Plugin Page API、真实 Extractor + Reviewer 双阶段运行和 reload 前的服务健康检查; 这不是 24 小时 soak 结论. 仍应连续观察队列、WAL、provider 消耗、实际注入和 QQ 收发, 再逐步扩大 target.
 

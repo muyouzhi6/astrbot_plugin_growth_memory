@@ -90,6 +90,12 @@ CREATE TABLE IF NOT EXISTS entry_evidence_batches(
  entry_id TEXT NOT NULL, batch_id TEXT NOT NULL, evidence_count INTEGER NOT NULL,
  evidence_dates_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
  PRIMARY KEY(entry_id,batch_id));
+CREATE TABLE IF NOT EXISTS entry_evidence_messages(
+ entry_id TEXT NOT NULL, message_row_id TEXT NOT NULL, observed_date TEXT NOT NULL,
+ batch_id TEXT NOT NULL, created_at TEXT NOT NULL,
+ PRIMARY KEY(entry_id,message_row_id));
+CREATE INDEX IF NOT EXISTS idx_entry_evidence_messages_batch
+ ON entry_evidence_messages(entry_id,batch_id);
 CREATE TABLE IF NOT EXISTS target_checkpoints(
  target_id TEXT PRIMARY KEY, committed_anchor_seq INTEGER NOT NULL DEFAULT 0,
  last_successful_run_id TEXT, last_successful_at TEXT, updated_at TEXT NOT NULL);
@@ -481,11 +487,16 @@ class GrowthStore:
         ]
 
     def entries(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
-        where = "" if include_archived else "WHERE status != 'archived'"
+        where = (
+            ""
+            if include_archived
+            else "WHERE status != 'archived' AND (expires_at IS NULL OR expires_at>?)"
+        )
+        params = () if include_archived else (now_iso(),)
         return [
             dict(r)
             for r in self._db()
-            .execute(f"SELECT * FROM entries {where} ORDER BY updated_at DESC")
+            .execute(f"SELECT * FROM entries {where} ORDER BY updated_at DESC", params)
             .fetchall()
         ]
 
@@ -626,18 +637,28 @@ class GrowthStore:
         self,
         entry_id: str,
         batch_id: str,
-        evidence_count: int,
-        evidence_dates: list[str],
+        evidence_messages: list[tuple[str, str]],
         base_count: int = 0,
         base_dates: list[str] | None = None,
     ) -> tuple[int, list[str]]:
-        dates = sorted({str(value)[:10] for value in evidence_dates if value})
+        messages = {
+            str(message_id): str(observed_date)[:10]
+            for message_id, observed_date in evidence_messages
+            if message_id and observed_date
+        }
         with self._lock:
             db = self._db()
-            if not db.execute(
-                "SELECT 1 FROM entry_evidence_batches WHERE entry_id=? LIMIT 1",
-                (entry_id,),
-            ).fetchone() and (base_count > 0 or base_dates):
+            if (
+                not db.execute(
+                    "SELECT 1 FROM entry_evidence_batches WHERE entry_id=? LIMIT 1",
+                    (entry_id,),
+                ).fetchone()
+                and not db.execute(
+                    "SELECT 1 FROM entry_evidence_messages WHERE entry_id=? LIMIT 1",
+                    (entry_id,),
+                ).fetchone()
+                and (base_count > 0 or base_dates)
+            ):
                 db.execute(
                     "INSERT OR IGNORE INTO entry_evidence_batches(entry_id,batch_id,evidence_count,evidence_dates_json,created_at) "
                     "VALUES(?,?,?,?,?)",
@@ -655,24 +676,59 @@ class GrowthStore:
                 (
                     entry_id,
                     batch_id,
-                    max(0, int(evidence_count)),
-                    json.dumps(dates, ensure_ascii=False),
+                    0,
+                    "[]",
                     now_iso(),
                 ),
             )
-            rows = db.execute(
+            db.executemany(
+                "INSERT OR IGNORE INTO entry_evidence_messages(entry_id,message_row_id,observed_date,batch_id,created_at) "
+                "VALUES(?,?,?,?,?)",
+                [
+                    (entry_id, message_id, date, batch_id, now_iso())
+                    for message_id, date in messages.items()
+                ],
+            )
+            legacy_rows = db.execute(
                 "SELECT evidence_count,evidence_dates_json FROM entry_evidence_batches WHERE entry_id=?",
                 (entry_id,),
             ).fetchall()
+            message_rows = db.execute(
+                "SELECT observed_date FROM entry_evidence_messages WHERE entry_id=?",
+                (entry_id,),
+            ).fetchall()
             db.commit()
-        total = sum(int(row["evidence_count"]) for row in rows)
+        total = sum(int(row["evidence_count"]) for row in legacy_rows) + len(
+            message_rows
+        )
         all_dates: set[str] = set()
-        for row in rows:
+        for row in legacy_rows:
             try:
                 all_dates.update(json.loads(row["evidence_dates_json"] or "[]"))
             except (TypeError, ValueError):
                 continue
+        all_dates.update(str(row["observed_date"]) for row in message_rows)
         return total, sorted(all_dates)
+
+    def archive_expired_entries(self) -> int:
+        db = self._db()
+        cursor = db.execute(
+            "UPDATE entries SET status='archived',updated_at=? "
+            "WHERE status!='archived' AND expires_at IS NOT NULL AND expires_at<=?",
+            (now_iso(), now_iso()),
+        )
+        db.commit()
+        return int(cursor.rowcount)
+
+    def archive_stale_drafts(self, cutoff: str) -> int:
+        db = self._db()
+        cursor = db.execute(
+            "UPDATE entries SET status='archived',updated_at=? "
+            "WHERE source_kind='scheduled' AND status='draft' AND updated_at<?",
+            (now_iso(), cutoff),
+        )
+        db.commit()
+        return int(cursor.rowcount)
 
     def reserve_learning_budget(
         self,

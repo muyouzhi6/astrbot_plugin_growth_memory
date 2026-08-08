@@ -84,7 +84,11 @@ class FakeLLMContext:
         return SimpleNamespace(role="assistant", completion_text=output)
 
 
-def ready_anchor(store: GrowthStore, sender_key="aiocqhttp:user:10001"):
+def ready_anchor(
+    store: GrowthStore,
+    sender_key="aiocqhttp:user:10001",
+    text="以后画图不要偏黄",
+):
     target = store.upsert_target(
         {"platform": "aiocqhttp", "chat_type": "private", "peer_id": "10001"}
     )
@@ -93,7 +97,7 @@ def ready_anchor(store: GrowthStore, sender_key="aiocqhttp:user:10001"):
         direction="inbound",
         sender_key=sender_key,
         sender_name="owner",
-        text="以后画图不要偏黄",
+        text=text,
         session_id="s1",
         source="platform_inbound",
     )
@@ -163,6 +167,78 @@ class PluginRuntimeTests(unittest.TestCase):
             entry2 = store.save_entry({**entry, "content": "避免偏黄和复古滤镜"})
             self.assertEqual(entry2["version"], 2)
             self.assertEqual(store.counts()["learning_targets"], 1)
+
+    def test_entry_evidence_is_deduplicated_by_message(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = GrowthStore(Path(td) / "db.sqlite")
+            store.open()
+            entry = store.save_entry(
+                {
+                    "scope_type": "person",
+                    "scope_key": "aiocqhttp:user:10001",
+                    "kind": "profile_fact",
+                    "content": "偏好简洁回答",
+                    "status": "draft",
+                    "trust_level": "model_inference",
+                }
+            )
+            first = store.register_entry_evidence(
+                entry["entry_id"],
+                "batch-1",
+                [("message-1", "2026-08-07")],
+            )
+            second = store.register_entry_evidence(
+                entry["entry_id"],
+                "batch-2",
+                [
+                    ("message-1", "2026-08-07"),
+                    ("message-2", "2026-08-08"),
+                ],
+            )
+            self.assertEqual(first, (1, ["2026-08-07"]))
+            self.assertEqual(second, (2, ["2026-08-07", "2026-08-08"]))
+
+    def test_expired_entries_leave_runtime_and_stale_drafts_archive(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = GrowthStore(Path(td) / "db.sqlite")
+            store.open()
+            expired = store.save_entry(
+                {
+                    "scope_type": "owner",
+                    "kind": "profile_fact",
+                    "content": "过期内容",
+                    "status": "active",
+                    "trust_level": "manual",
+                    "expires_at": "2000-01-01T00:00:00Z",
+                }
+            )
+            draft = store.save_entry(
+                {
+                    "scope_type": "person",
+                    "scope_key": "aiocqhttp:user:10001",
+                    "kind": "profile_fact",
+                    "content": "陈旧草稿",
+                    "status": "draft",
+                    "trust_level": "model_inference",
+                    "source_kind": "scheduled",
+                }
+            )
+            store._db().execute(
+                "UPDATE entries SET updated_at='2000-01-01T00:00:00Z' WHERE entry_id=?",
+                (draft["entry_id"],),
+            )
+            store._db().commit()
+            visible_ids = {row["entry_id"] for row in store.entries()}
+            self.assertNotIn(expired["entry_id"], visible_ids)
+            self.assertIn(draft["entry_id"], visible_ids)
+            self.assertEqual(store.archive_expired_entries(), 1)
+            self.assertEqual(store.archive_stale_drafts("2026-01-01T00:00:00Z"), 1)
+            archived = {
+                row["entry_id"]: row["status"]
+                for row in store.entries(include_archived=True)
+            }
+            self.assertEqual(archived[expired["entry_id"]], "archived")
+            self.assertEqual(archived[draft["entry_id"]], "archived")
 
     def test_existing_database_migration_is_idempotent_and_preserves_entries(self):
         with tempfile.TemporaryDirectory() as td:
@@ -407,9 +483,13 @@ class PluginRuntimeTests(unittest.TestCase):
                         "source_kind": "manual",
                     }
                 )
-                ready_anchor(store)
+                anchor = ready_anchor(store)
                 proposal = json.dumps(
-                    {**proposal_template, "target_entry_id": manual["entry_id"]},
+                    {
+                        **proposal_template,
+                        "target_entry_id": manual["entry_id"],
+                        "evidence_ids": [anchor["question_row_id"]],
+                    },
                     ensure_ascii=False,
                 )
                 pipeline = LearningPipeline(
@@ -478,26 +558,26 @@ class PluginRuntimeTests(unittest.TestCase):
         asyncio.run(run())
 
     def test_two_stage_learning_commits_owner_rule_with_budget(self):
-        proposal = json.dumps(
-            [
-                {
-                    "scope_type": "task",
-                    "scope_key": "drawing",
-                    "kind": "behavior_rule",
-                    "content": "绘图避免偏黄画面",
-                    "triggers": ["画图"],
-                    "signal_type": "owner_explicit",
-                    "confidence": 0.98,
-                }
-            ],
-            ensure_ascii=False,
-        )
-
         async def run():
             with tempfile.TemporaryDirectory() as td:
                 store = GrowthStore(Path(td) / "db.sqlite")
                 store.open()
-                ready_anchor(store)
+                anchor = ready_anchor(store)
+                proposal = json.dumps(
+                    [
+                        {
+                            "scope_type": "task",
+                            "scope_key": "drawing",
+                            "kind": "behavior_rule",
+                            "content": "绘图避免偏黄画面",
+                            "triggers": ["画图"],
+                            "signal_type": "owner_explicit",
+                            "confidence": 0.98,
+                            "evidence_ids": [anchor["question_row_id"]],
+                        }
+                    ],
+                    ensure_ascii=False,
+                )
                 context = FakeLLMContext([proposal, proposal])
                 snapshot = RuntimeSnapshot(
                     TargetMatcher(),
@@ -778,20 +858,6 @@ class PluginRuntimeTests(unittest.TestCase):
         asyncio.run(run())
 
     def test_person_alias_accumulates_cross_day_evidence_before_trial(self):
-        proposal = json.dumps(
-            [
-                {
-                    "scope_type": "user",
-                    "scope_key": "aiocqhttp:user:10001",
-                    "kind": "profile_fact",
-                    "content": "偏好简洁回答",
-                    "conflict_key": "person.reply_style",
-                    "confidence": 0.95,
-                }
-            ],
-            ensure_ascii=False,
-        )
-
         async def run():
             with tempfile.TemporaryDirectory() as td:
                 store = GrowthStore(Path(td) / "db.sqlite")
@@ -804,8 +870,26 @@ class PluginRuntimeTests(unittest.TestCase):
                     (first["question_row_id"], second["question_row_id"]),
                 )
                 store._db().commit()
+                proposal = json.dumps(
+                    [
+                        {
+                            "scope_type": "user",
+                            "scope_key": "aiocqhttp:user:10001",
+                            "kind": "profile_fact",
+                            "content": "偏好简洁回答",
+                            "conflict_key": "person.reply_style",
+                            "confidence": 0.95,
+                            "evidence_ids": [
+                                first["question_row_id"],
+                                second["question_row_id"],
+                            ],
+                        }
+                    ],
+                    ensure_ascii=False,
+                )
+                context = FakeLLMContext([proposal, proposal])
                 pipeline = LearningPipeline(
-                    FakeLLMContext([proposal, proposal, proposal, proposal]),
+                    context,
                     store,
                     {
                         "extractor_provider_id": "extract",
@@ -827,6 +911,21 @@ class PluginRuntimeTests(unittest.TestCase):
                     (third["question_row_id"],),
                 )
                 store._db().commit()
+                next_proposal = json.dumps(
+                    [
+                        {
+                            "scope_type": "user",
+                            "scope_key": "aiocqhttp:user:10001",
+                            "kind": "profile_fact",
+                            "content": "偏好简洁回答",
+                            "conflict_key": "person.reply_style",
+                            "confidence": 0.95,
+                            "evidence_ids": [third["question_row_id"]],
+                        }
+                    ],
+                    ensure_ascii=False,
+                )
+                context.outputs.extend([next_proposal, next_proposal])
                 second_result = await pipeline.run_due(force=True)
                 self.assertEqual(second_result["processed"], 1)
                 entry = store.entries()[0]
@@ -834,6 +933,125 @@ class PluginRuntimeTests(unittest.TestCase):
                 self.assertEqual(entry["trust_level"], "repeated_observation")
                 self.assertEqual(entry["evidence_count"], 3)
                 self.assertEqual(entry["evidence_days"], 2)
+
+        asyncio.run(run())
+
+    def test_owner_directive_does_not_raise_unrelated_proposal_trust(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as td:
+                store = GrowthStore(Path(td) / "db.sqlite")
+                store.open()
+                ready_anchor(store, text="以后画图不要偏黄")
+                unrelated = ready_anchor(
+                    store,
+                    sender_key="aiocqhttp:user:10002",
+                    text="今天天气不错",
+                )
+                proposal = json.dumps(
+                    [
+                        {
+                            "scope_type": "task",
+                            "scope_key": "drawing",
+                            "kind": "behavior_rule",
+                            "content": "所有图片都改成黑白",
+                            "triggers": ["画图"],
+                            "confidence": 0.99,
+                            "evidence_ids": [unrelated["question_row_id"]],
+                        }
+                    ],
+                    ensure_ascii=False,
+                )
+                pipeline = LearningPipeline(
+                    FakeLLMContext([proposal, proposal]),
+                    store,
+                    {
+                        "extractor_provider_id": "extract",
+                        "reviewer_provider_id": "review",
+                    },
+                    lambda: RuntimeSnapshot(
+                        TargetMatcher(),
+                        owner_identities=frozenset({"aiocqhttp:user:10001"}),
+                    ),
+                )
+                result = await pipeline.run_due(force=True)
+                self.assertEqual(result["processed"], 2)
+                self.assertEqual(store.entries(), [])
+
+        asyncio.run(run())
+
+    def test_automatic_global_profile_fact_is_rejected(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as td:
+                store = GrowthStore(Path(td) / "db.sqlite")
+                store.open()
+                anchor = ready_anchor(store, text="Gemini 为什么会变慢")
+                proposal = json.dumps(
+                    [
+                        {
+                            "scope_type": "global",
+                            "kind": "profile_fact",
+                            "content": "长上下文会增加首字延迟",
+                            "confidence": 0.99,
+                            "evidence_ids": [anchor["question_row_id"]],
+                        }
+                    ],
+                    ensure_ascii=False,
+                )
+                refreshed = []
+                pipeline = LearningPipeline(
+                    FakeLLMContext([proposal, proposal]),
+                    store,
+                    {
+                        "extractor_provider_id": "extract",
+                        "reviewer_provider_id": "review",
+                    },
+                    lambda: RuntimeSnapshot(TargetMatcher()),
+                    snapshot_refresher=lambda: refreshed.append(True),
+                )
+                pipeline.last_error = "old provider error"
+                await pipeline.run_due(force=True)
+                self.assertEqual(store.entries(), [])
+                self.assertEqual(refreshed, [])
+                self.assertEqual(pipeline.last_error, "")
+
+        asyncio.run(run())
+
+    def test_learning_refreshes_snapshot_after_commit(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as td:
+                store = GrowthStore(Path(td) / "db.sqlite")
+                store.open()
+                anchor = ready_anchor(store)
+                proposal = json.dumps(
+                    [
+                        {
+                            "scope_type": "task",
+                            "scope_key": "drawing",
+                            "kind": "behavior_rule",
+                            "content": "绘图避免偏黄",
+                            "triggers": ["画图"],
+                            "confidence": 0.98,
+                            "evidence_ids": [anchor["question_row_id"]],
+                        }
+                    ],
+                    ensure_ascii=False,
+                )
+                refreshed = []
+                pipeline = LearningPipeline(
+                    FakeLLMContext([proposal, proposal]),
+                    store,
+                    {
+                        "extractor_provider_id": "extract",
+                        "reviewer_provider_id": "review",
+                    },
+                    lambda: RuntimeSnapshot(
+                        TargetMatcher(),
+                        owner_identities=frozenset({"aiocqhttp:user:10001"}),
+                    ),
+                    snapshot_refresher=lambda: refreshed.append(True),
+                )
+                await pipeline.run_due(force=True)
+                self.assertEqual(refreshed, [True])
 
         asyncio.run(run())
 

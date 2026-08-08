@@ -280,7 +280,7 @@ Capture writer:
 - 一个有界 FIFO 接收 immutable capture envelope, 一个 `aiosqlite` writer actor 是唯一写 owner.
 - 每个 hook 预生成 row/anchor ID. Anchor envelope 内嵌 question snapshot, 所以异步写入不产生 question/anchor 外键竞态.
 - 满队列先逐出 context-only. 全 critical 满载时设置 degraded 并暂停学习, 不同步落盘, 不无限等待, 正常聊天继续.
-- mutation commit 后异步构建完整 runtime snapshot, 单引用切换; injection 永远读取旧或新完整 snapshot, 不读半成品.
+- mutation commit 后立即构建完整 runtime snapshot 并单引用切换; injection 永远读取旧或新完整 snapshot, 不读半成品.
 
 Worker:
 
@@ -297,7 +297,7 @@ Backup:
 - migration 前自动备份.
 - 导入先写临时数据库并验证, 成功后原子替换.
 - 确认 owner 规则不因低使用率自动删除.
-- inferred group/person 条目 90 天无证据后 suspended, 180 天后 archive.
+- 自动生成的 draft 90 天未确认后 archive; 显式 `expires_at` 到期后最多 5 分钟退出 runtime snapshot 并 archive.
 
 指标:
 
@@ -383,7 +383,7 @@ Persona:
 - `ruff check` 通过.
 - `ruff format --check` 通过.
 - `compileall` 通过.
-- 45 项单元测试通过, 包括 target gate, runtime-boundary tests, delayed anchor completion, stale anchor cleanup, schedule timezone/toggle, runtime validation、旧库迁移、人物跨日证据晋级和 Web API rollback.
+- 50 项单元测试通过, 包括 target gate, runtime-boundary tests, delayed anchor completion, stale anchor cleanup, schedule timezone/toggle, runtime validation、旧库迁移、人物跨日证据晋级、proposal 证据隔离、snapshot 即时刷新和 Web API rollback.
 - 完整 DDL 已通过内存 SQLite 验证: 18 张业务表与 `sqlite_sequence`, 共 56 个 table/index 对象; `PRAGMA integrity_check` 为 `ok`, `PRAGMA foreign_key_check` 为空.
 - 120 个候选条目下执行 10,000 次选择:
   - p50 `0.1824 ms`.
