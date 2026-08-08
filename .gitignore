@@ -1,0 +1,13 @@
+# Runtime and local verification artifacts
+__pycache__/
+.ruff_cache/
+.pytest_cache/
+data/*.db
+data/*.db-*
+data/*.sqlite
+data/*.sqlite-*
+data/*.png
+
+# Local AstrBot configuration accidentally copied into the working directory.
+data/cmd_config.json
+data/t2i_templates/
