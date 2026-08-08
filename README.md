@@ -1,0 +1,56 @@
+# 小本本记下来
+
+`astrbot_plugin_growth_memory` 是面向 AstrBot 4.24+ 的个人成长记忆插件. 它只在显式开启的 QQ 私聊或群聊中采集学习证据, 默认 target 列表为空; 已形成的条目按 owner, task, group, person 作用域独立注入, 停止学习不会让已有记忆失效.
+
+## 功能
+
+- 管理员使用 `/进化`, `/停止进化`, `/进化状态` 幂等管理当前 QQ 会话.
+- 默认每日 `03:00 Asia/Shanghai` 学习, Plugin Page 最多维护 8 个时间点.
+- 每个 anchor 取问题前后各 10 条消息, 重叠窗口去重, 每批最多 10 个 anchor 且输入不超过 4,000 估算 token.
+- Extractor 和 Reviewer 分阶段持久化. Reviewer 失败不会重跑已成功的 Extractor.
+- 每日默认最多 8 次学习请求和 16,000 输入 token. 单次 provider timeout 45 秒, 即时重试 1 次, 连续失败触发 30 分钟 circuit breaker.
+- 单 writer + SQLite WAL + 有界 FIFO. 队列过载时优先保留 anchor/answer, 暂停学习但不阻塞聊天.
+- 聊天 hook 不等待 SQLite; anchor 迟到时用内存 pending completion 补绑定, 1 小时 TTL 回收 abandoned state.
+- 条目使用追加版本, WebUI 支持查看、编辑和回滚.
+- Reviewer 的 trust/status 由服务端依据 owner 原话和重复证据推导, 自动学习不能改写人工条目.
+- 单轮注入默认最多 800 估算 token, 只使用内存 snapshot, 不在聊天热路径调用学习模型.
+- 原始消息默认保留 14 天; 未完成 anchor 的问题和答案不按普通 TTL 删除.
+
+## 安装
+
+将整个目录安装为 AstrBot 插件, 目录名保持 `astrbot_plugin_growth_memory`. 插件没有第三方运行依赖, AstrBot 4.26.8 可直接加载.
+
+首次在 AstrBot 插件配置中设置:
+
+1. `owner_identities`: 主人身份, 例如 `aiocqhttp:123456789`.
+2. `extractor_provider_id`: 第一阶段模型的 AstrBot provider ID.
+3. `reviewer_provider_id`: 审查模型 provider ID; 留空时复用 Extractor provider.
+4. `capture_enabled`: 全局 kill switch. 默认 `true`, 但 target 为空时不会采集任何会话.
+
+随后在需要学习的 QQ 私聊或群聊发送 `/进化`, 或从插件详情页进入 `小本本记下来` Page 添加精确 QQ 号/群号. Plugin Page 的 target、schedule 和 runtime settings 写入 SQLite, plugin reload 后保持不变.
+
+数据库位于 AstrBot 分配给插件的 data 目录下:
+
+```text
+growth_memory.db
+```
+
+## 验证
+
+```bash
+PYTHONPATH=.. python3 -m unittest discover -s tests -v
+ruff check .
+ruff format --check .
+python3 -m compileall -q .
+```
+
+当前实现通过 42 项离线和组件集成测试, 并在 AstrBot 4.26.8 的 `uv` 环境完成真实 import、handler registry 和 `initialize -> terminate` 生命周期检查; 另完成 2,000 条上下文和 40 个关键事件的 writer 压力探针. 详细证据见 [验证记录](docs/VALIDATION.md).
+
+本地验证不能替代线上 QQ shadow 和 24 小时 soak. 部署到京东云后应先只开启一个低风险会话, 检查次日学习 run、实际注入、provider 消耗和 reload 恢复, 再逐步扩大 target.
+
+## 设计文档
+
+- [技术设计](docs/TECHNICAL_DESIGN.md)
+- [工程实施规格](docs/IMPLEMENTATION_SPEC.md)
+- [定时学习管线规格](docs/SCHEDULED_LEARNING_PIPELINE.md)
+- [验证记录](docs/VALIDATION.md)

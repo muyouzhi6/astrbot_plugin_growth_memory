@@ -1,0 +1,1 @@
+# AstrBot 4.26.8 already supplies the runtime dependencies used by this plugin.

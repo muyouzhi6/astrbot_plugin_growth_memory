@@ -1,0 +1,51 @@
+{
+  "owner_identities": {
+    "type": "list",
+    "description": "主人身份, 每项填写 platform:user_id, 例如 aiocqhttp:123456",
+    "default": []
+  },
+  "capture_enabled": {
+    "type": "bool",
+    "description": "全局捕获开关; 目标白名单为空时仍不会捕获",
+    "default": true
+  },
+  "initial_learning_targets": {
+    "type": "list",
+    "description": "首次启动时导入的学习目标, 之后请在 WebUI 或 /进化 管理",
+    "default": []
+  },
+  "extractor_provider_id": {
+    "type": "string",
+    "description": "Extractor 使用的 provider ID, 留空则不自动调用",
+    "default": ""
+  },
+  "reviewer_provider_id": {
+    "type": "string",
+    "description": "Reviewer 使用的 provider ID, 留空则不自动调用",
+    "default": ""
+  },
+  "daily_request_budget": {
+    "type": "int",
+    "description": "每日学习请求上限",
+    "default": 8,
+    "slider": {"min": 1, "max": 32, "step": 1}
+  },
+  "daily_input_token_budget": {
+    "type": "int",
+    "description": "每日学习输入 token 估算上限",
+    "default": 16000,
+    "slider": {"min": 2000, "max": 64000, "step": 1000}
+  },
+  "injection_token_budget": {
+    "type": "int",
+    "description": "单轮记忆注入硬上限",
+    "default": 800,
+    "slider": {"min": 128, "max": 2400, "step": 64}
+  },
+  "capture_buffer_capacity": {
+    "type": "int",
+    "description": "捕获有界 FIFO 容量",
+    "default": 2048,
+    "slider": {"min": 128, "max": 16384, "step": 128}
+  }
+}
