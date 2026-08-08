@@ -8,7 +8,8 @@
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
-    <main>
+    <div id="page-status" class="loading-status" role="status" aria-live="polite" hidden><span>正在同步</span></div>
+    <main id="app" aria-busy="true">
       <header class="topbar">
         <div>
           <p class="eyebrow">ASTRBOT / PERSONAL MEMORY</p>
@@ -16,14 +17,14 @@
           <p class="lede">把主人说过的偏好、群聊规矩和共同经历, 变成可审查、可回滚、不会撑爆上下文的记忆.</p>
         </div>
         <div class="top-actions">
-          <span id="health-pill" class="pill">检查中</span>
+          <span id="health-pill" class="pill" role="status" aria-live="polite">检查中</span>
           <button id="run-now" class="primary">立即学习</button>
           <button id="refresh" class="secondary">刷新</button>
         </div>
       </header>
 
       <section class="metrics" id="metrics" aria-label="运行概况"></section>
-      <section id="alert" class="alert" hidden></section>
+      <section id="alert" class="alert" role="alert" aria-live="assertive" hidden></section>
 
       <section class="workspace-grid">
         <article class="panel panel-targets">
@@ -80,6 +81,7 @@
       <dialog id="entry-dialog"><form method="dialog" id="entry-form" class="dialog-form"><div class="dialog-head"><div><p class="kicker">MEMORY ENTRY</p><h2 id="entry-dialog-title">新建记忆条目</h2></div><button value="cancel" class="icon-button" aria-label="关闭">×</button></div><input name="entry_id" type="hidden" /><div class="form-grid"><label>层级<select name="scope_type"><option value="owner">主人</option><option value="task">任务</option><option value="group">群聊</option><option value="person">人物</option><option value="global">全局</option></select></label><label>条目类型<select name="kind"><option value="behavior_rule">行为规则</option><option value="profile_fact">画像事实</option><option value="milestone">共同经历</option></select></label><label>层级匹配键<input name="scope_key" placeholder="如 drawing 或 aiocqhttp:group:12345" /></label><label>状态<select name="status"><option value="active">生效</option><option value="trial">试用</option><option value="draft">草稿</option><option value="suspended">暂停</option><option value="archived">归档</option></select></label><label class="wide">触发词 <span class="muted">用逗号分隔</span><input name="triggers" placeholder="画图, 生图, 自拍" /></label><label class="wide">内容<textarea name="content" rows="5" maxlength="4000" required placeholder="写成明确、可执行的一句话"></textarea></label><label>优先级<input name="priority" type="number" min="-100" max="100" step="1" value="0" /></label><label>可见性<select name="visibility"><option value="public">普通</option><option value="owner_only">仅主人</option><option value="behavior_only">仅行为注入</option></select></label></div><div class="dialog-actions"><button value="cancel" class="secondary">取消</button><button value="save" class="primary">保存条目</button></div></form></dialog>
       <dialog id="rollback-dialog"><form method="dialog" id="rollback-form" class="dialog-form"><div class="dialog-head"><div><p class="kicker">VERSION CONTROL</p><h2>回滚记忆条目</h2><p id="rollback-entry-label" class="muted"></p></div><button value="cancel" class="icon-button" aria-label="关闭">×</button></div><input name="entry_id" type="hidden" /><label>目标版本<select name="version" required></select></label><div class="dialog-actions"><button value="cancel" class="secondary">取消</button><button value="save" class="primary">确认回滚</button></div></form></dialog>
     </main>
+    <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
     <script type="module" src="./app.js"></script>
   </body>
 </html>

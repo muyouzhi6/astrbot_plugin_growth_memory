@@ -278,15 +278,20 @@ class LearningPipeline:
         self._last_entry_expiry_at = 0.0
 
     async def start(self) -> None:
+        if self._running:
+            return
         db = self.store._db()
+        stamp = now_iso()
         db.execute(
             "UPDATE learning_batches SET status='deferred',lease_until=NULL,updated_at=? "
-            "WHERE status='running'",
-            (now_iso(),),
+            "WHERE status='running' AND (lease_until IS NULL OR lease_until<=?)",
+            (stamp, stamp),
         )
         db.execute(
-            "UPDATE learning_runs SET status='deferred',updated_at=? WHERE status='running'",
-            (now_iso(),),
+            "UPDATE learning_runs SET status='deferred',updated_at=? WHERE status='running' "
+            "AND NOT EXISTS (SELECT 1 FROM learning_batches b WHERE b.run_id=learning_runs.run_id "
+            "AND b.status='running' AND b.lease_until>?)",
+            (stamp, stamp),
         )
         db.commit()
         self._running = True
@@ -686,25 +691,29 @@ class LearningPipeline:
         return str(row[0])
 
     async def _resume_reviews(self) -> dict[str, int]:
+        stamp = now_iso()
         rows = (
             self.store._db()
             .execute(
                 "SELECT batch_id,input_refs_json FROM learning_batches WHERE stage='review' "
-                "AND status IN ('pending','deferred') AND not_before<=? ORDER BY created_at LIMIT 20",
-                (now_iso(),),
+                "AND ((status IN ('pending','deferred') AND not_before<=?) OR "
+                "(status='running' AND (lease_until IS NULL OR lease_until<=?))) "
+                "ORDER BY created_at LIMIT 20",
+                (stamp, stamp),
             )
             .fetchall()
         )
         processed = deferred = 0
         for row in rows:
             count = len(json.loads(row["input_refs_json"] or "[]"))
-            if await self._execute_review(row["batch_id"]):
+            outcome = await self._execute_review(row["batch_id"])
+            if outcome is True:
                 processed += count
-            else:
+            elif outcome is False:
                 deferred += count
         return {"processed": processed, "deferred": deferred}
 
-    async def _execute_review(self, review_batch_id: str) -> bool:
+    async def _execute_review(self, review_batch_id: str) -> bool | None:
         db = self.store._db()
         batch = db.execute(
             "SELECT * FROM learning_batches WHERE batch_id=?", (review_batch_id,)
@@ -723,15 +732,25 @@ class LearningPipeline:
             ).fetchall()
         ]
         proposals = json.loads(batch["output_json"] or "[]")
-        db.execute(
-            "UPDATE learning_batches SET status='running',attempts=attempts+1,lease_until=?,updated_at=? WHERE batch_id=?",
-            (
-                (datetime.now(ZoneInfo("UTC")) + timedelta(minutes=2)).isoformat(),
-                now_iso(),
-                review_batch_id,
-            ),
+        stamp = now_iso()
+        lease_until = (datetime.now(ZoneInfo("UTC")) + timedelta(minutes=5)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
         )
+        claimed = db.execute(
+            "UPDATE learning_batches SET status='running',attempts=attempts+1,lease_until=?,updated_at=? "
+            "WHERE batch_id=? AND stage='review' AND ((status IN ('pending','deferred') AND not_before<=?) "
+            "OR (status='running' AND (lease_until IS NULL OR lease_until<=?)))",
+            (
+                lease_until,
+                stamp,
+                review_batch_id,
+                stamp,
+                stamp,
+            ),
+        ).rowcount
         db.commit()
+        if not claimed:
+            return None
         try:
             await self._review_and_commit(
                 batch["run_id"], review_batch_id, anchors, proposals
@@ -741,21 +760,34 @@ class LearningPipeline:
             not_before = (
                 datetime.now(ZoneInfo("UTC")) + timedelta(minutes=30)
             ).strftime("%Y-%m-%dT%H:%M:%SZ")
-            db.execute(
-                "UPDATE learning_batches SET status='deferred',lease_until=NULL,not_before=?,last_error_code=?,updated_at=? WHERE batch_id=?",
-                (not_before, type(exc).__name__, now_iso(), review_batch_id),
-            )
+            released = db.execute(
+                "UPDATE learning_batches SET status='deferred',lease_until=NULL,not_before=?,last_error_code=?,updated_at=? "
+                "WHERE batch_id=? AND status='running' AND lease_until=?",
+                (
+                    not_before,
+                    type(exc).__name__,
+                    now_iso(),
+                    review_batch_id,
+                    lease_until,
+                ),
+            ).rowcount
+            if not released:
+                db.commit()
+                return None
             db.execute(
                 "UPDATE learning_runs SET status='deferred',completed_at=NULL,updated_at=? WHERE run_id=?",
                 (now_iso(), batch["run_id"]),
             )
             db.commit()
             return False
-        db.execute(
-            "UPDATE learning_batches SET status='succeeded',lease_until=NULL,updated_at=? WHERE batch_id=?",
-            (now_iso(), review_batch_id),
-        )
+        completed = db.execute(
+            "UPDATE learning_batches SET status='succeeded',lease_until=NULL,updated_at=? "
+            "WHERE batch_id=? AND status='running' AND lease_until=?",
+            (now_iso(), review_batch_id, lease_until),
+        ).rowcount
         db.commit()
+        if not completed:
+            return None
         for anchor in anchors:
             self.store.update_anchor(anchor["anchor_id"], status="committed")
         self._refresh_run_status(str(batch["run_id"]))

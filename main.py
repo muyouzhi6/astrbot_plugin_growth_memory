@@ -115,6 +115,15 @@ RUNTIME_SETTING_LIMITS = {
     "daily_input_token_budget": (2000, 64000),
     "injection_token_budget": (128, 2400),
 }
+SAFE_RUNTIME_DEFAULTS = {
+    "owner_identities": [],
+    "capture_enabled": False,
+    "extractor_provider_id": "",
+    "reviewer_provider_id": "",
+    "daily_request_budget": 8,
+    "daily_input_token_budget": 16000,
+    "injection_token_budget": 800,
+}
 
 
 class TargetCaptureFilter(getattr(filter, "CustomFilter", object)):  # type: ignore[misc]
@@ -157,16 +166,24 @@ class GrowthMemory(Star):
         self._anchor_state_started_at: dict[str, float] = {}
         self._pending_completions: dict[str, tuple[str, str, str, str]] = {}
         self._routes: list[tuple[str, list[str]]] = []
+        self._initialized = False
 
     async def initialize(self) -> None:
-        self.store.open()
-        self._load_runtime_flags()
-        self._seed()
-        self._refresh_snapshot()
-        await self.writer.start()
-        await self.pipeline.start()
-        self._register_web_api()
-        logger.info("[%s] initialized: %s", PLUGIN_NAME, self.store.counts())
+        if self._initialized:
+            return
+        self._initialized = True
+        try:
+            self.store.open()
+            self._load_runtime_flags()
+            self._seed()
+            self._refresh_snapshot()
+            await self.writer.start()
+            await self.pipeline.start()
+            self._register_web_api()
+            logger.info("[%s] initialized: %s", PLUGIN_NAME, self.store.counts())
+        except BaseException:
+            await self.terminate()
+            raise
 
     def _load_runtime_flags(self) -> None:
         flags = self.store.runtime_flags()
@@ -181,10 +198,23 @@ class GrowthMemory(Star):
             ),
             "injection_token_budget": self.config.get("injection_token_budget", 800),
         }
-        for key, value in defaults.items():
-            if key not in flags:
-                self.store.set_runtime_flag(key, value, "config_seed")
-                flags[key] = value
+        for key, configured_value in defaults.items():
+            value = flags.get(key, configured_value)
+            try:
+                self._validate_runtime_updates({key: value})
+            except ValueError as exc:
+                value = SAFE_RUNTIME_DEFAULTS[key]
+                logger.warning(
+                    "[%s] repaired invalid runtime flag %s: %s",
+                    PLUGIN_NAME,
+                    key,
+                    exc,
+                )
+                self.store.set_runtime_flag(key, value, "runtime_repair")
+            else:
+                if key not in flags:
+                    self.store.set_runtime_flag(key, value, "config_seed")
+            flags[key] = value
         self.config.update(
             {key: value for key, value in flags.items() if key in RUNTIME_SETTING_KEYS}
         )
@@ -879,6 +909,7 @@ class GrowthMemory(Star):
                 if not item[0].startswith("/astrbot_plugin_growth_memory/")
             ]
         self.store.close()
+        self._initialized = False
 
 
 __all__ = ["GrowthMemory", "TargetCaptureFilter"]

@@ -1,6 +1,6 @@
 const bridge = window.AstrBotPluginPage;
 const $ = (id) => document.getElementById(id);
-const state = { entries: [], schedules: [], settings: {} };
+const state = { entries: [], schedules: [], settings: {}, pendingRequests: 0 };
 
 const labels = {
   active: "生效", trial: "试用", draft: "草稿", suspended: "暂停", archived: "归档",
@@ -20,9 +20,31 @@ function showToast(message, error = false) {
   showToast.timer = window.setTimeout(() => { toast.className = "toast"; }, 3600);
 }
 
+function setBusy(active) {
+  state.pendingRequests = Math.max(0, state.pendingRequests + (active ? 1 : -1));
+  const busy = state.pendingRequests > 0;
+  document.body.dataset.busy = String(busy);
+  $("app").setAttribute("aria-busy", String(busy));
+  $("page-status").hidden = !busy;
+  document.querySelectorAll("button, input, select, textarea").forEach((control) => {
+    if (busy && !control.hasAttribute("data-busy-was-disabled")) {
+      control.dataset.busyWasDisabled = String(control.disabled);
+      control.disabled = true;
+    } else if (!busy && control.hasAttribute("data-busy-was-disabled")) {
+      control.disabled = control.dataset.busyWasDisabled === "true";
+      delete control.dataset.busyWasDisabled;
+    }
+  });
+}
+
 async function api(method, endpoint, body) {
-  const fn = method === "GET" ? bridge.apiGet : bridge.apiPost;
-  return fn(endpoint, body);
+  if (!bridge) throw new Error("AstrBot Plugin Page bridge 未就绪");
+  setBusy(true);
+  try {
+    return method === "GET" ? await bridge.apiGet(endpoint, body) : await bridge.apiPost(endpoint, body);
+  } finally {
+    setBusy(false);
+  }
 }
 
 function formatTime(value) {
@@ -67,7 +89,7 @@ function renderSchedules(rows) {
 
 function renderRuns(rows) {
   if (!rows.length) { $("runs").innerHTML = '<p class="empty">还没有学习运行记录.</p>'; return; }
-  $("runs").innerHTML = `<table><thead><tr><th>时间</th><th>类型</th><th>状态</th><th>请求</th><th>输入 Token</th><th>完成</th></tr></thead><tbody>${rows.map((row) => `<tr><td>${escapeHtml(formatTime(row.created_at))}</td><td>${escapeHtml(labels[row.run_kind] || row.run_kind)}</td><td class="status-${escapeHtml(row.status)}">${escapeHtml(labels[row.status] || row.status)}</td><td>${escapeHtml(row.request_count)}</td><td>${escapeHtml(row.input_tokens_estimated)}</td><td>${escapeHtml(formatTime(row.completed_at))}</td></tr>`).join("")}</tbody></table>`;
+  $("runs").innerHTML = `<table><thead><tr><th scope="col">时间</th><th scope="col">类型</th><th scope="col">状态</th><th scope="col">请求</th><th scope="col">输入 Token</th><th scope="col">完成</th></tr></thead><tbody>${rows.map((row) => `<tr><td>${escapeHtml(formatTime(row.created_at))}</td><td>${escapeHtml(labels[row.run_kind] || row.run_kind)}</td><td class="status-${escapeHtml(row.status)}">${escapeHtml(labels[row.status] || row.status)}</td><td>${escapeHtml(row.request_count)}</td><td>${escapeHtml(row.input_tokens_estimated)}</td><td>${escapeHtml(formatTime(row.completed_at))}</td></tr>`).join("")}</tbody></table>`;
 }
 
 function triggersOf(row) {
@@ -261,5 +283,11 @@ $("rollback-form").addEventListener("submit", async (event) => {
   } catch (error) { showToast(String(error), true); }
 });
 
-await bridge.ready();
-load().catch((error) => showToast(String(error), true));
+try {
+  if (!bridge) throw new Error("AstrBot Plugin Page bridge 未注入, 请从 AstrBot 插件详情页打开");
+  await bridge.ready();
+  await load();
+} catch (error) {
+  $("app").setAttribute("aria-busy", "false");
+  showToast(String(error), true);
+}

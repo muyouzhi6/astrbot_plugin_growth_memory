@@ -557,6 +557,107 @@ class PluginRuntimeTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_initialize_is_idempotent_for_same_instance(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as td:
+                plugin = GrowthMemory(FakeContext(), {})
+                plugin.store = GrowthStore(Path(td) / "db.sqlite")
+                plugin.writer = __import__(
+                    "astrbot_plugin_growth_memory.runtime", fromlist=["CaptureWriter"]
+                ).CaptureWriter(plugin.store, plugin.capture)
+                plugin.pipeline = LearningPipeline(
+                    plugin.context,
+                    plugin.store,
+                    plugin.config,
+                    lambda: plugin.gate.snapshot,
+                    lambda: plugin.capture.degraded,
+                )
+                await plugin.initialize()
+                ticker = plugin.pipeline._ticker
+                writer_task = plugin.writer._task
+                await plugin.initialize()
+                self.assertIs(plugin.pipeline._ticker, ticker)
+                self.assertIs(plugin.writer._task, writer_task)
+                self.assertEqual(len(plugin.context.registered_web_apis), 12)
+                await plugin.terminate()
+
+        asyncio.run(run())
+
+    def test_invalid_persisted_runtime_flags_are_repaired_on_load(self):
+        with tempfile.TemporaryDirectory() as td:
+            plugin = GrowthMemory(FakeContext(), {})
+            plugin.store = GrowthStore(Path(td) / "db.sqlite")
+            plugin.store.open()
+            plugin.store.set_runtime_flag("capture_enabled", "yes", "manual")
+            plugin.store.set_runtime_flag("daily_request_budget", 999, "manual")
+            plugin._load_runtime_flags()
+            self.assertFalse(plugin.config["capture_enabled"])
+            self.assertEqual(plugin.config["daily_request_budget"], 8)
+            self.assertFalse(plugin.store.runtime_flags()["capture_enabled"])
+            self.assertEqual(plugin.store.runtime_flags()["daily_request_budget"], 8)
+            plugin.store.close()
+
+    def test_review_batch_compare_and_set_prevents_duplicate_provider_calls(self):
+        class SlowContext(FakeLLMContext):
+            async def llm_generate(self, **kwargs):
+                await asyncio.sleep(0.05)
+                return await super().llm_generate(**kwargs)
+
+        async def run():
+            with tempfile.TemporaryDirectory() as td:
+                store = GrowthStore(Path(td) / "db.sqlite")
+                store.open()
+                anchor = ready_anchor(store)
+                proposal = {
+                    "scope_type": "task",
+                    "scope_key": "drawing",
+                    "kind": "behavior_rule",
+                    "content": "绘图避免偏黄",
+                    "triggers": ["画图"],
+                    "confidence": 0.98,
+                    "evidence_ids": [anchor["question_row_id"]],
+                }
+                context = SlowContext([json.dumps([proposal], ensure_ascii=False)])
+                pipeline = LearningPipeline(
+                    context,
+                    store,
+                    {
+                        "extractor_provider_id": "extract",
+                        "reviewer_provider_id": "review",
+                    },
+                    lambda: RuntimeSnapshot(
+                        TargetMatcher(),
+                        owner_identities=frozenset({"aiocqhttp:user:10001"}),
+                    ),
+                )
+                run_row = pipeline._create_run("manual:claim-test", "manual")
+                self.assertIsNotNone(run_row)
+                batch_id = pipeline._create_review_batch(
+                    run_row["run_id"], "extract-test", 0, [anchor], [proposal]
+                )
+                outcomes = await asyncio.gather(
+                    pipeline._execute_review(batch_id),
+                    pipeline._execute_review(batch_id),
+                )
+                self.assertEqual(outcomes.count(True), 1)
+                self.assertEqual(outcomes.count(None), 1)
+                self.assertEqual(context.calls, 1)
+                self.assertEqual(len(store.entries()), 1)
+
+        asyncio.run(run())
+
+    def test_dashboard_has_feedback_busy_and_accessibility_contracts(self):
+        root = Path(__file__).parents[1]
+        html = (root / "pages/dashboard/index.html").read_text(encoding="utf-8")
+        script = (root / "pages/dashboard/app.js").read_text(encoding="utf-8")
+        style = (root / "pages/dashboard/style.css").read_text(encoding="utf-8")
+        self.assertIn('id="toast"', html)
+        self.assertIn('id="page-status"', html)
+        self.assertIn('aria-live="polite"', html)
+        self.assertIn("function setBusy(active)", script)
+        self.assertIn("document.body.dataset.busy = String(busy)", script)
+        self.assertIn("prefers-reduced-motion", style)
+
     def test_two_stage_learning_commits_owner_rule_with_budget(self):
         async def run():
             with tempfile.TemporaryDirectory() as td:

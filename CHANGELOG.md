@@ -1,5 +1,12 @@
 # 变更记录
 
+## v0.2.3
+
+- 修复 Plugin Page 缺少 toast 节点导致所有操作反馈抛出异常的问题, 增加请求期间防重复提交、加载状态、可访问性播报和移动端操作区布局.
+- Reviewer batch 使用数据库 compare-and-set 和 5 分钟 lease 原子抢占, reload 短暂重叠时不重复调用模型; 过期 lease 可自动恢复.
+- 插件初始化改为幂等, 防止同一实例重复初始化遗留 writer、ticker 或 Web API route.
+- 启动时重新校验 SQLite runtime flags, 脏值自动修复为安全默认值并记录日志.
+
 ## v0.2.2
 
 - 将自动 proposal 的证据改为逐条 `message_row_id` 白名单校验, trust、证据条数和证据天数只按该 proposal 实际引用的入站消息计算.
