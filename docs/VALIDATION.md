@@ -53,7 +53,7 @@
 
 - 变更前备份: `/opt/1panel/apps/astrbot/astrbot/data/backups/astrbot_plugin_growth_memory/20260808-233856-v0.3.0-predeploy/`, 含旧插件、配置和 SQLite 在线备份.
 - 旧插件归档 SHA-256: `132eff0d200785b6b6dbf13aad07d218525b2e9f3b7567c1eb77a814f49a371e`; SQLite 备份 SHA-256: `c09434f71db08721b0d20f25a111a965162bef34f3b6fd01361e3781e9946c36`.
-- 发布包 SHA-256: `5ccb0567d7a57b5582fbbd28b34bd5bdff16f4269b5088c426345999a1c57b5d`.
+- 最终发布包 SHA-256: `febc1e86b051df01cd34f869159b9e65918fe6f7252921bffedf4f605c302bdd`.
 - AstrBot 4.27.1 日志确认加载 `v0.3.0`、作者 `木有知`, 注册 `growth_memory_note`, 完成 `GrowthMemory.initialize`; 第二次重启清理了 macOS `._*` 元数据文件, 不再有 i18n 解码警告.
 - `astrbot` 重启计数为 `0`, 状态为 `running`; NapCat 未重启且仍为 `running`.
 - 插件 SQLite 位于 `/opt/1panel/apps/astrbot/astrbot/data/plugin_data/astrbot_plugin_growth_memory/growth_memory.db`, 重启后 `PRAGMA integrity_check=ok`, `journal_mode=wal`; `learning_targets=5`, `entries=5`, `learning_runs=7`, `candidates=0`.
