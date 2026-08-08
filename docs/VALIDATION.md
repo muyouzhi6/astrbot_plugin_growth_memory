@@ -49,13 +49,15 @@
 
 ## 京东云基础部署证据
 
-2026-08-08 已将 GitHub `main` 的 `34f067ac71b44b4c390816e81059b11bd188f4f6` 部署到 `/opt/1panel/apps/astrbot/astrbot/data/plugins/astrbot_plugin_growth_memory`, 当前为 `v0.2.3`; `v0.3.0` 的主动记忆和 Provider 下拉改动待本轮发布后追加证据.
+2026-08-08 已将 GitHub `main` 的 `72550388c707851b55bbf764dc18be1d6b2268d7` 部署到 `/opt/1panel/apps/astrbot/astrbot/data/plugins/astrbot_plugin_growth_memory`, 当前为 `v0.3.0`.
 
-- 变更前备份: `/opt/1panel/apps/astrbot/astrbot/data/backups/astrbot_plugin_growth_memory/20260808-213108-v0.2.3-predeploy/`, 含旧插件、配置和 SQLite 在线备份.
-- 插件归档 SHA-256: `16753700be94e84638b135808c3021fec18e5b4df95e351f62efd86c56312394`.
-- AstrBot 4.27.1 日志确认加载 `v0.2.3`、作者 `木有知`, 完成 `GrowthMemory.initialize`, 并在 reload 时移除旧的 9 个 handler 后重新注册.
+- 变更前备份: `/opt/1panel/apps/astrbot/astrbot/data/backups/astrbot_plugin_growth_memory/20260808-233856-v0.3.0-predeploy/`, 含旧插件、配置和 SQLite 在线备份.
+- 旧插件归档 SHA-256: `132eff0d200785b6b6dbf13aad07d218525b2e9f3b7567c1eb77a814f49a371e`; SQLite 备份 SHA-256: `c09434f71db08721b0d20f25a111a965162bef34f3b6fd01361e3781e9946c36`.
+- 发布包 SHA-256: `5ccb0567d7a57b5582fbbd28b34bd5bdff16f4269b5088c426345999a1c57b5d`.
+- AstrBot 4.27.1 日志确认加载 `v0.3.0`、作者 `木有知`, 注册 `growth_memory_note`, 完成 `GrowthMemory.initialize`; 第二次重启清理了 macOS `._*` 元数据文件, 不再有 i18n 解码警告.
 - `astrbot` 重启计数为 `0`, 状态为 `running`; NapCat 未重启且仍为 `running`.
-- 插件 SQLite 位于 `/opt/1panel/apps/astrbot/astrbot/data/plugin_data/astrbot_plugin_growth_memory/growth_memory.db`, reload 后 `PRAGMA integrity_check=ok`, `journal_mode=wal`.
+- 插件 SQLite 位于 `/opt/1panel/apps/astrbot/astrbot/data/plugin_data/astrbot_plugin_growth_memory/growth_memory.db`, 重启后 `PRAGMA integrity_check=ok`, `journal_mode=wal`; `learning_targets=5`, `entries=5`, `learning_runs=7`, `candidates=0`.
+- 重启后 runtime flags 保留 `llm_note_enabled=true`, Extractor/Reviewer Provider 均为 `newapigemini/gemini-3.5-flash-low`; 配置文件中的显式预算值保持不变.
 - 受保护 Plugin Page API 未认证访问仍返回 `401`; 认证后 `state/settings/runs/entries` 均返回 `200`.
 - `v0.2.3` 真实 `run-now` 返回 `processed=5`, 最近 run 为 `succeeded`, `request_count=2`, `1876 estimated input tokens / 5170 output tokens`, queue `0`, `degraded=false`, `last_error=""`.
 - 本轮新增 `entry_evidence_messages=8`, 每条为 proposal 实际引用的入站 `message_row_id`; 当前 2 条人物草稿, 历史 3 条全局知识均保持 `archived`.
@@ -71,7 +73,7 @@
 - [ ] 完成一次真实流式和一次非流式问答, 验证 anchor question/answer.
 - [x] 执行一次真实 Extractor + Reviewer run, 核对 provider 请求数和 token 预算.
 - [ ] 在下一轮聊天检查条目实际注入并确认没有泄露 `behavior_only` 内容.
-- [x] 部署 `v0.2.3` 后 reload 插件, 验证 target, `03:00/20:00` schedule, runtime flags、条目、evidence links 和预算均恢复.
+- [x] 部署 `v0.3.0` 后重启 AstrBot, 验证 target、runtime flags、Provider、条目、SQLite 完整性和 `growth_memory_note` registry 均恢复.
 - [ ] 连续运行 24 小时, 检查 event loop latency, queue depth, WAL 大小, memory, provider 错误和 QQ 收发.
 
 当前状态为“已部署并完成真实学习/reload 验证”; 真实 QQ `/进化` 路径和 24 小时 soak 尚未冒充完成, 仍需按上表持续观察.
