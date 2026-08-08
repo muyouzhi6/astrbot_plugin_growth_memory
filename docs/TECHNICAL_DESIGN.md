@@ -383,7 +383,7 @@ Persona:
 - `ruff check` 通过.
 - `ruff format --check` 通过.
 - `compileall` 通过.
-- 42 项单元测试通过, 包括 target gate, runtime-boundary tests, delayed anchor completion, schedule timezone/toggle, runtime validation 和 Web API rollback.
+- 43 项单元测试通过, 包括 target gate, runtime-boundary tests, delayed anchor completion, stale anchor cleanup, schedule timezone/toggle, runtime validation 和 Web API rollback.
 - 完整 DDL 已通过内存 SQLite 验证: 18 张业务表与 `sqlite_sequence`, 共 56 个 table/index 对象; `PRAGMA integrity_check` 为 `ok`, `PRAGMA foreign_key_check` 为空.
 - 120 个候选条目下执行 10,000 次选择:
   - p50 `0.1824 ms`.

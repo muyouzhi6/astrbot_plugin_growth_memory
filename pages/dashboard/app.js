@@ -38,7 +38,7 @@ function renderMetrics(data) {
   const rows = [
     ["学习目标", counts.learning_targets || 0, data.snapshot?.capture_enabled ? "捕获开关开启" : "捕获开关关闭"],
     ["原始消息", counts.conversation_messages || 0, "保留 14 天"],
-    ["待处理 anchor", counts.trigger_anchors || 0, "问答证据"],
+    ["待处理 anchor", counts.pending_anchors ?? counts.trigger_anchors ?? 0, "问答证据"],
     ["记忆条目", counts.entries || 0, "按层级注入"],
     ["学习运行", counts.learning_runs || 0, "含失败和补跑"],
     ["今日预算", budget, "硬上限"],

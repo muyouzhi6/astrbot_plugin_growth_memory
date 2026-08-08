@@ -14,7 +14,7 @@
 - [x] 注册 9 个 handler.
 - [x] 确认 capture filters 顺序为 `TargetCaptureFilter -> EventMessageTypeFilter`.
 - [x] 完成 `initialize -> terminate`, 创建 10 个 Web API route, 停止 ticker, 清理 route.
-- [x] 通过 42 项 `unittest`.
+- [x] 通过 43 项 `unittest`.
 - [x] 通过 `ruff check .`.
 - [x] 通过 `ruff format --check .`.
 - [x] 通过 `python3 -m compileall -q .`.
@@ -26,7 +26,7 @@
 - [x] 验证 Reviewer 连续失败不重跑 Extractor.
 - [x] 验证每日 request budget 和 input token budget.
 - [x] 验证 schedule 12 小时 catch-up 和 slot 幂等.
-- [x] 验证 14 天 TTL 不删除未完成 anchor 证据.
+- [x] 验证 14 天 TTL 不删除仍在处理中的 anchor 证据, 且 stale missing anchor 会被取消.
 - [x] 验证注入不依赖 learning target 开关.
 - [x] 验证 Web API 只使用 AstrBot Plugin Page bridge 支持的 `GET/POST`.
 - [x] 验证聊天 hook 不等待 SQLite, writer 迟到时仍能绑定最终答案.

@@ -7,7 +7,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -269,6 +269,7 @@ class LearningPipeline:
         self._failure_count = 0
         self._circuit_until = 0.0
         self._last_maintenance_date = ""
+        self._last_anchor_cleanup_at = 0.0
 
     async def start(self) -> None:
         db = self.store._db()
@@ -317,6 +318,12 @@ class LearningPipeline:
             )
             result = {"scheduled": 0, "processed": 0, "deferred": 0}
             today = local.date().isoformat()
+            if time.monotonic() - self._last_anchor_cleanup_at >= 300:
+                cutoff = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+                self.store.cancel_stale_anchors(cutoff)
+                self._last_anchor_cleanup_at = time.monotonic()
             if self._last_maintenance_date != today:
                 self.store.cleanup_expired_messages()
                 self._last_maintenance_date = today

@@ -606,9 +606,33 @@ class GrowthStore:
         db.execute("PRAGMA wal_checkpoint(PASSIVE)")
         return int(cursor.rowcount)
 
+    def cancel_stale_anchors(self, cutoff: str, limit: int = 500) -> int:
+        """Cancel requests that never produced a final answer after the hook TTL."""
+        if limit <= 0:
+            return 0
+        with self._lock:
+            db = self._db()
+            rows = db.execute(
+                "SELECT anchor_id FROM trigger_anchors "
+                "WHERE status IN ('open','retryable') "
+                "AND answer_state IN ('missing','error') "
+                "AND created_at<? ORDER BY created_at LIMIT?",
+                (cutoff, limit),
+            ).fetchall()
+            if not rows:
+                return 0
+            stamp = now_iso()
+            db.executemany(
+                "UPDATE trigger_anchors SET status='cancelled',request_state='aborted',"
+                "answer_state='aborted',updated_at=? WHERE anchor_id=?",
+                [(stamp, row["anchor_id"]) for row in rows],
+            )
+            db.commit()
+            return len(rows)
+
     def counts(self) -> dict[str, int]:
         db = self._db()
-        return {
+        counts = {
             name: int(db.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0])
             for name in (
                 "learning_targets",
@@ -619,3 +643,10 @@ class GrowthStore:
                 "learning_batches",
             )
         }
+        counts["pending_anchors"] = int(
+            db.execute(
+                "SELECT COUNT(*) FROM trigger_anchors "
+                "WHERE status IN ('open','retryable')"
+            ).fetchone()[0]
+        )
+        return counts

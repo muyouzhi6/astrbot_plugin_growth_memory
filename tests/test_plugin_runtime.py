@@ -163,6 +163,40 @@ class PluginRuntimeTests(unittest.TestCase):
             self.assertEqual(entry2["version"], 2)
             self.assertEqual(store.counts()["learning_targets"], 1)
 
+    def test_stale_missing_anchors_are_cancelled(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = GrowthStore(Path(td) / "db.sqlite")
+            store.open()
+            target = store.upsert_target(
+                {"platform": "aiocqhttp", "chat_type": "private", "peer_id": "12345"}
+            )
+            question = store.create_message(
+                target["target_id"],
+                direction="inbound",
+                sender_key="aiocqhttp:user:12345",
+                sender_name="tester",
+                text="question",
+                session_id="s1",
+                source="platform_inbound",
+            )
+            anchor = store.create_anchor(
+                target["target_id"], question["row_id"], "2000-01-01T00:00:00Z"
+            )
+            store.update_anchor(
+                anchor["anchor_id"],
+                created_at="2000-01-01T00:00:00Z",
+            )
+            self.assertEqual(store.cancel_stale_anchors("2020-01-01T00:00:00Z"), 1)
+            row = (
+                store._db()
+                .execute(
+                    "SELECT status,request_state,answer_state FROM trigger_anchors WHERE anchor_id=?",
+                    (anchor["anchor_id"],),
+                )
+                .fetchone()
+            )
+            self.assertEqual(tuple(row), ("cancelled", "aborted", "aborted"))
+
     def test_anchor_lifecycle_and_no_provider_defers(self):
         async def run():
             with tempfile.TemporaryDirectory() as td:

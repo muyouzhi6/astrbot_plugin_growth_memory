@@ -11,6 +11,7 @@
 - 每日默认最多 8 次学习请求和 16,000 输入 token. 单次 provider timeout 45 秒, 即时重试 1 次, 连续失败触发 30 分钟 circuit breaker.
 - 单 writer + SQLite WAL + 有界 FIFO. 队列过载时优先保留 anchor/answer, 暂停学习但不阻塞聊天.
 - 聊天 hook 不等待 SQLite; anchor 迟到时用内存 pending completion 补绑定, 1 小时 TTL 回收 abandoned state.
+- 未产生最终回答的 `missing/retryable` anchor 超过 2 小时自动取消, 防止异常或并发锁造成长期堆积.
 - 条目使用追加版本, WebUI 支持查看、编辑和回滚.
 - Reviewer 的 trust/status 由服务端依据 owner 原话和重复证据推导, 自动学习不能改写人工条目.
 - 单轮注入默认最多 800 估算 token, 只使用内存 snapshot, 不在聊天热路径调用学习模型.
@@ -44,7 +45,7 @@ ruff format --check .
 python3 -m compileall -q .
 ```
 
-当前实现通过 42 项离线和组件集成测试, 并在 AstrBot 4.26.8 的 `uv` 环境完成真实 import、handler registry 和 `initialize -> terminate` 生命周期检查; 另完成 2,000 条上下文和 40 个关键事件的 writer 压力探针. 详细证据见 [验证记录](docs/VALIDATION.md).
+当前实现通过 43 项离线和组件集成测试, 并在 AstrBot 4.26.8 的 `uv` 环境完成真实 import、handler registry 和 `initialize -> terminate` 生命周期检查; 另完成 2,000 条上下文和 40 个关键事件的 writer 压力探针. 详细证据见 [验证记录](docs/VALIDATION.md).
 
 本地验证不能替代线上 QQ shadow 和 24 小时 soak. 部署到京东云后应先只开启一个低风险会话, 检查次日学习 run、实际注入、provider 消耗和 reload 恢复, 再逐步扩大 target.
 
