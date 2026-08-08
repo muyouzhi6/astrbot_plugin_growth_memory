@@ -14,7 +14,7 @@
 - [x] 注册 9 个 handler.
 - [x] 确认 capture filters 顺序为 `TargetCaptureFilter -> EventMessageTypeFilter`.
 - [x] 完成 `initialize -> terminate`, 创建 12 个 Web API route, 停止 ticker, 清理 route.
-- [x] 通过 50 项 `unittest`.
+- [x] 通过 54 项 `unittest`.
 - [x] 通过 `ruff check .`.
 - [x] 通过 `ruff format --check .`.
 - [x] 通过 `python3 -m compileall -q .`.
@@ -39,22 +39,27 @@
 - [x] 验证同批主人指令不会提升无关 proposal, 自动 `global profile_fact/milestone` 被拒绝.
 - [x] 验证学习写入后立即刷新 runtime snapshot, 过期条目退出注入, 90 天陈旧自动草稿归档.
 - [x] 验证 Plugin Page 桌面/390px 移动端无横向溢出, 弹窗可滚动, 暗色主题变量和禁用态可读.
+- [x] 验证 Dashboard toast 反馈、异步请求期间控件禁用、动态状态 `aria-live` 和 reduced-motion.
+- [x] 验证同一插件实例重复 `initialize()` 不重复创建 writer、ticker 或 Web API route.
+- [x] 验证 Reviewer batch 数据库 compare-and-set 抢占, 并发执行同一 batch 只调用一次 Provider.
+- [x] 验证启动时非法 SQLite runtime flag 自动修复为安全默认值.
 - [x] 完成 2,000 条上下文和 40 个关键事件的有界 writer 压力探针, 队列清空且 SQLite 无异常.
 
 ## 京东云基础部署证据
 
-2026-08-08 已将 GitHub `main` 的 `da60e8533ccd4bde72f640214e1798c980660749` 部署到 `/opt/1panel/apps/astrbot/astrbot/data/plugins/astrbot_plugin_growth_memory`; 当前为 `v0.2.1`, 本轮将更新为 `v0.2.2`.
+2026-08-08 已将 GitHub `main` 的 `34f067ac71b44b4c390816e81059b11bd188f4f6` 部署到 `/opt/1panel/apps/astrbot/astrbot/data/plugins/astrbot_plugin_growth_memory`, 当前为 `v0.2.3`.
 
-- 变更前备份: `/opt/1panel/apps/astrbot/astrbot/data/backups/astrbot_plugin_growth_memory/20260808-201936-v0.2.1-predeploy/`.
-- AstrBot 4.27.1 日志确认加载 `v0.2.1`、作者 `木有知`, 并完成 `GrowthMemory.initialize`.
+- 变更前备份: `/opt/1panel/apps/astrbot/astrbot/data/backups/astrbot_plugin_growth_memory/20260808-213108-v0.2.3-predeploy/`, 含旧插件、配置和 SQLite 在线备份.
+- 插件归档 SHA-256: `16753700be94e84638b135808c3021fec18e5b4df95e351f62efd86c56312394`.
+- AstrBot 4.27.1 日志确认加载 `v0.2.3`、作者 `木有知`, 完成 `GrowthMemory.initialize`, 并在 reload 时移除旧的 9 个 handler 后重新注册.
 - `astrbot` 重启计数为 `0`, 状态为 `running`; NapCat 未重启且仍为 `running`.
-- 插件 SQLite 位于 `/opt/1panel/apps/astrbot/astrbot/data/plugin_data/astrbot_plugin_growth_memory/growth_memory.db`, `PRAGMA integrity_check=ok`, `journal_mode=wal`.
-- 初始运行状态为 0 个学习目标、0 条消息、0 个 anchor、0 个条目, 自动创建 1 个 `03:00 Asia/Shanghai` 时间点.
-- 未认证访问管理 API 返回 `401`, 说明管理接口没有裸奔.
-- 已通过受保护 Plugin Page API 执行真实 `run-now`: 1 个 anchor 提交, 2 次 provider 调用成功, 本轮记录 `1212 estimated input tokens / 4274 output tokens`, 队列为 0, `degraded=false`.
-- 已通过 AstrBot v1 管理 API 完成插件级 reload, target 5 个、`03:00/20:00` schedule、runtime flags、3 个草稿条目和学习预算均恢复.
+- 插件 SQLite 位于 `/opt/1panel/apps/astrbot/astrbot/data/plugin_data/astrbot_plugin_growth_memory/growth_memory.db`, reload 后 `PRAGMA integrity_check=ok`, `journal_mode=wal`.
+- 受保护 Plugin Page API 未认证访问仍返回 `401`; 认证后 `state/settings/runs/entries` 均返回 `200`.
+- `v0.2.3` 真实 `run-now` 返回 `processed=5`, 最近 run 为 `succeeded`, `request_count=2`, `1876 estimated input tokens / 5170 output tokens`, queue `0`, `degraded=false`, `last_error=""`.
+- 本轮新增 `entry_evidence_messages=8`, 每条为 proposal 实际引用的入站 `message_row_id`; 当前 2 条人物草稿, 历史 3 条全局知识均保持 `archived`.
+- 学习完成后再次插件级 reload, target 5 个、`03:00/20:00`、主人身份、Provider、预算 `8/8`、runtime snapshot 和 evidence links 均恢复.
 
-上述是安装和启动证据, 不是生产稳定结论. Dashboard 页面需要使用现有 AstrBot 管理账号登录后打开 `小本本记下来`; 未在服务器上绕过认证重置密码.
+上述是版本、运行、reload 和数据恢复证据. Dashboard 页面需要使用现有 AstrBot 管理账号登录后打开 `小本本记下来`; 未在服务器上绕过认证重置密码.
 
 ## 部署后必须验证
 
@@ -64,7 +69,7 @@
 - [ ] 完成一次真实流式和一次非流式问答, 验证 anchor question/answer.
 - [x] 执行一次真实 Extractor + Reviewer run, 核对 provider 请求数和 token 预算.
 - [ ] 在下一轮聊天检查条目实际注入并确认没有泄露 `behavior_only` 内容.
-- [x] 部署 `v0.2.1` 后 reload 插件, 验证 target, `03:00/20:00` schedule, runtime flags、条目和预算均恢复.
+- [x] 部署 `v0.2.3` 后 reload 插件, 验证 target, `03:00/20:00` schedule, runtime flags、条目、evidence links 和预算均恢复.
 - [ ] 连续运行 24 小时, 检查 event loop latency, queue depth, WAL 大小, memory, provider 错误和 QQ 收发.
 
-只有上述部署后检查完成, 才能把状态从“本地可加载实现”提升为“生产验证完成”.
+当前状态为“已部署并完成真实学习/reload 验证”; 真实 QQ `/进化` 路径和 24 小时 soak 尚未冒充完成, 仍需按上表持续观察.
