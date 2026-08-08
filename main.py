@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .runtime import (
     AnchorHandle,
@@ -101,6 +102,7 @@ except ImportError:  # pragma: no cover - only used by local import/compile test
 PLUGIN_NAME = "astrbot_plugin_growth_memory"
 ANCHOR_STATE_TTL_SECONDS = 60 * 60
 RUNTIME_SETTING_KEYS = {
+    "owner_identities",
     "capture_enabled",
     "extractor_provider_id",
     "reviewer_provider_id",
@@ -167,22 +169,21 @@ class GrowthMemory(Star):
 
     def _load_runtime_flags(self) -> None:
         flags = self.store.runtime_flags()
-        if not flags:
-            defaults = {
-                "capture_enabled": self.config.get("capture_enabled", True),
-                "extractor_provider_id": self.config.get("extractor_provider_id", ""),
-                "reviewer_provider_id": self.config.get("reviewer_provider_id", ""),
-                "daily_request_budget": self.config.get("daily_request_budget", 8),
-                "daily_input_token_budget": self.config.get(
-                    "daily_input_token_budget", 16000
-                ),
-                "injection_token_budget": self.config.get(
-                    "injection_token_budget", 800
-                ),
-            }
-            for key, value in defaults.items():
+        defaults = {
+            "owner_identities": self.config.get("owner_identities", []),
+            "capture_enabled": self.config.get("capture_enabled", True),
+            "extractor_provider_id": self.config.get("extractor_provider_id", ""),
+            "reviewer_provider_id": self.config.get("reviewer_provider_id", ""),
+            "daily_request_budget": self.config.get("daily_request_budget", 8),
+            "daily_input_token_budget": self.config.get(
+                "daily_input_token_budget", 16000
+            ),
+            "injection_token_budget": self.config.get("injection_token_budget", 800),
+        }
+        for key, value in defaults.items():
+            if key not in flags:
                 self.store.set_runtime_flag(key, value, "config_seed")
-            flags = defaults
+                flags[key] = value
         self.config.update(
             {key: value for key, value in flags.items() if key in RUNTIME_SETTING_KEYS}
         )
@@ -228,6 +229,7 @@ class GrowthMemory(Star):
                         trust=TrustLevel(row.get("trust_level", "model_inference")),
                         confidence=float(row.get("confidence", 0)),
                         evidence_count=int(row.get("evidence_count", 0)),
+                        evidence_days=int(row.get("evidence_days", 0)),
                         priority=int(row.get("priority", 0)),
                         visibility=Visibility(row.get("visibility", "public")),
                         updated_at=row.get("updated_at", ""),
@@ -256,6 +258,22 @@ class GrowthMemory(Star):
 
     @staticmethod
     def _validate_runtime_updates(updates: dict[str, Any]) -> None:
+        if "owner_identities" in updates:
+            values = updates["owner_identities"]
+            if (
+                not isinstance(values, list)
+                or len(values) > 20
+                or any(
+                    not isinstance(value, str)
+                    or not value.startswith("aiocqhttp:")
+                    or not value.removeprefix("aiocqhttp:").isdigit()
+                    or not 5 <= len(value.removeprefix("aiocqhttp:")) <= 20
+                    for value in values
+                )
+            ):
+                raise ValueError(
+                    "owner_identities must contain at most 20 aiocqhttp:QQ entries"
+                )
         if "capture_enabled" in updates and not isinstance(
             updates["capture_enabled"], bool
         ):
@@ -608,6 +626,10 @@ class GrowthMemory(Star):
             ("/astrbot_plugin_growth_memory/targets/<target_id>", ["POST"]),
             ("/astrbot_plugin_growth_memory/entries", ["GET", "POST"]),
             ("/astrbot_plugin_growth_memory/entries/<entry_id>", ["POST"]),
+            (
+                "/astrbot_plugin_growth_memory/entries/<entry_id>/versions",
+                ["GET"],
+            ),
             ("/astrbot_plugin_growth_memory/entries/<entry_id>/rollback", ["POST"]),
             ("/astrbot_plugin_growth_memory/schedules", ["GET", "POST"]),
             ("/astrbot_plugin_growth_memory/schedules/<schedule_id>", ["POST"]),
@@ -629,6 +651,7 @@ class GrowthMemory(Star):
             return error_response("dashboard authentication required", status_code=401)
         try:
             if path.endswith("/state"):
+                budget_date = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
                 return json_response(
                     {
                         "plugin": PLUGIN_NAME,
@@ -640,6 +663,8 @@ class GrowthMemory(Star):
                         "counts": self.store.counts(),
                         "targets": self.store.targets(),
                         "schedules": self.store.schedules(),
+                        "budget": self.store.daily_budget(budget_date),
+                        "queue_depth": self.capture.size,
                         "degraded": self.capture.degraded,
                         "last_error": self.pipeline.last_error,
                     }
@@ -670,6 +695,14 @@ class GrowthMemory(Star):
                     self._refresh_snapshot()
                     return json_response(result)
             if "/entries" in path:
+                if path.endswith("/versions") and method == "GET":
+                    entry_id = str(path_params.get("entry_id") or "")
+                    if not any(
+                        row["entry_id"] == entry_id
+                        for row in self.store.entries(include_archived=True)
+                    ):
+                        return error_response("entry not found", status_code=404)
+                    return json_response(self.store.entry_versions(entry_id))
                 if path.endswith("/rollback") and method == "POST":
                     body = await request.json(default={})
                     version = int((body or {}).get("version", 0))
@@ -686,7 +719,7 @@ class GrowthMemory(Star):
                     self._refresh_snapshot()
                     return json_response(row)
                 if method == "GET":
-                    return json_response(self.store.entries())
+                    return json_response(self.store.entries(include_archived=True))
                 body = await request.json(default={})
                 if not isinstance(body, dict):
                     return error_response("JSON object required")
@@ -695,7 +728,7 @@ class GrowthMemory(Star):
                         current = next(
                             (
                                 item
-                                for item in self.store.entries()
+                                for item in self.store.entries(include_archived=True)
                                 if item["entry_id"] == path_params["entry_id"]
                             ),
                             None,
@@ -724,10 +757,8 @@ class GrowthMemory(Star):
                 schedule_id = path_params.get("schedule_id")
                 if schedule_id and method == "POST":
                     body = await request.json(default={})
-                    if not isinstance(body, dict) or not isinstance(
-                        body.get("enabled"), bool
-                    ):
-                        return error_response("enabled boolean required")
+                    if not isinstance(body, dict):
+                        return error_response("JSON object required")
                     current = next(
                         (
                             item
@@ -738,6 +769,21 @@ class GrowthMemory(Star):
                     )
                     if not current:
                         return error_response("schedule not found", status_code=404)
+                    if body.get("action") == "delete":
+                        self.store.delete_schedule(schedule_id)
+                        self.store.audit(username, "delete", "schedule", schedule_id)
+                        return json_response({"ok": True})
+                    if "local_time" in body or "timezone" in body:
+                        row = self.store.update_schedule(
+                            schedule_id,
+                            str(body.get("local_time", current["local_time"])),
+                            str(body.get("timezone", current["timezone"])),
+                            bool(body.get("enabled", current["enabled"])),
+                        )
+                        self.store.audit(username, "update", "schedule", schedule_id)
+                        return json_response(row)
+                    if not isinstance(body.get("enabled"), bool):
+                        return error_response("enabled boolean required")
                     self.store.set_schedule_enabled(schedule_id, body["enabled"])
                     self.store.audit(
                         username,
@@ -783,6 +829,7 @@ class GrowthMemory(Star):
                         {
                             k: self.config.get(k)
                             for k in (
+                                "owner_identities",
                                 "capture_enabled",
                                 "extractor_provider_id",
                                 "reviewer_provider_id",

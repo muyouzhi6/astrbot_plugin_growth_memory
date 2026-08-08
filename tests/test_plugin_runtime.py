@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime
@@ -162,6 +163,62 @@ class PluginRuntimeTests(unittest.TestCase):
             entry2 = store.save_entry({**entry, "content": "避免偏黄和复古滤镜"})
             self.assertEqual(entry2["version"], 2)
             self.assertEqual(store.counts()["learning_targets"], 1)
+
+    def test_existing_database_migration_is_idempotent_and_preserves_entries(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "db.sqlite"
+            db = sqlite3.connect(db_path)
+            db.execute(
+                """CREATE TABLE entries(
+                entry_id TEXT PRIMARY KEY, scope_type TEXT NOT NULL,
+                scope_key TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '', content TEXT NOT NULL,
+                triggers_json TEXT NOT NULL DEFAULT '[]', conflict_key TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL, trust_level TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0, priority INTEGER NOT NULL DEFAULT 0,
+                visibility TEXT NOT NULL DEFAULT 'public', evidence_count INTEGER NOT NULL DEFAULT 0,
+                expires_at TEXT, version INTEGER NOT NULL DEFAULT 1,
+                source_kind TEXT NOT NULL DEFAULT 'manual', content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"""
+            )
+            db.execute(
+                "INSERT INTO entries(entry_id,scope_type,kind,content,status,trust_level,"
+                "evidence_count,content_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "legacy-entry",
+                    "person",
+                    "profile_fact",
+                    "偏好简洁回答",
+                    "draft",
+                    "model_inference",
+                    2,
+                    "hash",
+                    "2026-08-07T00:00:00Z",
+                    "2026-08-07T00:00:00Z",
+                ),
+            )
+            db.commit()
+            db.close()
+
+            store = GrowthStore(db_path)
+            store.open()
+            row = store.entries()[0]
+            self.assertEqual(row["entry_id"], "legacy-entry")
+            self.assertEqual(row["evidence_count"], 2)
+            self.assertEqual(row["evidence_days"], 0)
+            self.assertEqual(row["evidence_dates_json"], "[]")
+            self.assertIsNotNone(
+                store._db()
+                .execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='entry_evidence_batches'"
+                )
+                .fetchone()
+            )
+            store.close()
+            store.open()
+            self.assertEqual(store.entries()[0]["content"], "偏好简洁回答")
+            store.close()
 
     def test_stale_missing_anchors_are_cancelled(self):
         with tempfile.TemporaryDirectory() as td:
@@ -461,6 +518,10 @@ class PluginRuntimeTests(unittest.TestCase):
                 self.assertEqual(store.entries()[0]["status"], "active")
                 budget = store._db().execute("SELECT * FROM daily_budget").fetchone()
                 self.assertEqual(budget["request_count"], 2)
+                run_row = store._db().execute("SELECT * FROM learning_runs").fetchone()
+                self.assertEqual(run_row["request_count"], 2)
+                self.assertGreater(run_row["input_tokens_estimated"], 0)
+                self.assertGreater(run_row["output_tokens_actual"], 0)
 
         asyncio.run(run())
 
@@ -583,6 +644,11 @@ class PluginRuntimeTests(unittest.TestCase):
             GrowthMemory._validate_runtime_updates({"daily_request_budget": 0})
         with self.assertRaises(ValueError):
             GrowthMemory._validate_runtime_updates({"capture_enabled": "false"})
+        with self.assertRaises(ValueError):
+            GrowthMemory._validate_runtime_updates({"owner_identities": ["qq:123456"]})
+        GrowthMemory._validate_runtime_updates(
+            {"owner_identities": ["aiocqhttp:123456"]}
+        )
 
     def test_web_api_post_update_and_rollback(self):
         async def run():
@@ -626,6 +692,18 @@ class PluginRuntimeTests(unittest.TestCase):
 
                     plugin_main.request = FakeWebRequest(
                         "POST",
+                        f"/api/plug/astrbot_plugin_growth_memory/schedules/{schedule_id}",
+                        {
+                            "local_time": "05:15",
+                            "timezone": "Asia/Shanghai",
+                            "enabled": True,
+                        },
+                    )
+                    edited_schedule = await plugin.web_api(schedule_id=schedule_id)
+                    self.assertEqual(edited_schedule.data["local_time"], "05:15")
+
+                    plugin_main.request = FakeWebRequest(
+                        "POST",
                         "/api/plug/astrbot_plugin_growth_memory/entries",
                         {
                             "scope_type": "task",
@@ -648,6 +726,15 @@ class PluginRuntimeTests(unittest.TestCase):
                     self.assertEqual(updated.data["version"], 2)
 
                     plugin_main.request = FakeWebRequest(
+                        "GET",
+                        f"/api/plug/astrbot_plugin_growth_memory/entries/{entry_id}/versions",
+                    )
+                    versions = await plugin.web_api(entry_id=entry_id)
+                    self.assertEqual(
+                        [item["version"] for item in versions.data], [2, 1]
+                    )
+
+                    plugin_main.request = FakeWebRequest(
                         "POST",
                         f"/api/plug/astrbot_plugin_growth_memory/entries/{entry_id}/rollback",
                         {"version": 1},
@@ -655,8 +742,98 @@ class PluginRuntimeTests(unittest.TestCase):
                     rolled = await plugin.web_api(entry_id=entry_id)
                     self.assertEqual(rolled.data["content"], "避免偏黄")
                     self.assertEqual(rolled.data["version"], 3)
+
+                    plugin_main.request = FakeWebRequest(
+                        "POST",
+                        f"/api/plug/astrbot_plugin_growth_memory/entries/{entry_id}",
+                        {"status": "archived"},
+                    )
+                    archived = await plugin.web_api(entry_id=entry_id)
+                    self.assertEqual(archived.data["status"], "archived")
+                    plugin_main.request = FakeWebRequest(
+                        "GET", "/api/plug/astrbot_plugin_growth_memory/entries"
+                    )
+                    visible = await plugin.web_api()
+                    self.assertEqual(visible.data[0]["entry_id"], entry_id)
+
+                    plugin_main.request = FakeWebRequest(
+                        "POST",
+                        f"/api/plug/astrbot_plugin_growth_memory/schedules/{schedule_id}",
+                        {"action": "delete"},
+                    )
+                    deleted = await plugin.web_api(schedule_id=schedule_id)
+                    self.assertTrue(deleted.data["ok"])
+
+                    remaining = plugin.store.schedules()[0]
+                    plugin_main.request = FakeWebRequest(
+                        "POST",
+                        f"/api/plug/astrbot_plugin_growth_memory/schedules/{remaining['schedule_id']}",
+                        {"action": "delete"},
+                    )
+                    refused = await plugin.web_api(schedule_id=remaining["schedule_id"])
+                    self.assertEqual(refused.status_code, 422)
             finally:
                 plugin_main.request = original_request
+
+        asyncio.run(run())
+
+    def test_person_alias_accumulates_cross_day_evidence_before_trial(self):
+        proposal = json.dumps(
+            [
+                {
+                    "scope_type": "user",
+                    "scope_key": "aiocqhttp:user:10001",
+                    "kind": "profile_fact",
+                    "content": "偏好简洁回答",
+                    "conflict_key": "person.reply_style",
+                    "confidence": 0.95,
+                }
+            ],
+            ensure_ascii=False,
+        )
+
+        async def run():
+            with tempfile.TemporaryDirectory() as td:
+                store = GrowthStore(Path(td) / "db.sqlite")
+                store.open()
+                first = ready_anchor(store)
+                second = ready_anchor(store)
+                store._db().execute(
+                    "UPDATE conversation_messages SET occurred_at='2026-08-07T10:00:00Z' "
+                    "WHERE row_id IN (?,?)",
+                    (first["question_row_id"], second["question_row_id"]),
+                )
+                store._db().commit()
+                pipeline = LearningPipeline(
+                    FakeLLMContext([proposal, proposal, proposal, proposal]),
+                    store,
+                    {
+                        "extractor_provider_id": "extract",
+                        "reviewer_provider_id": "review",
+                    },
+                    lambda: RuntimeSnapshot(TargetMatcher()),
+                )
+                first_result = await pipeline.run_due(force=True)
+                self.assertEqual(first_result["processed"], 2)
+                entry = store.entries()[0]
+                self.assertEqual(entry["scope_type"], "person")
+                self.assertEqual(entry["status"], "draft")
+                self.assertEqual(entry["evidence_count"], 2)
+                self.assertEqual(entry["evidence_days"], 1)
+
+                third = ready_anchor(store)
+                store._db().execute(
+                    "UPDATE conversation_messages SET occurred_at='2026-08-08T10:00:00Z' WHERE row_id=?",
+                    (third["question_row_id"],),
+                )
+                store._db().commit()
+                second_result = await pipeline.run_due(force=True)
+                self.assertEqual(second_result["processed"], 1)
+                entry = store.entries()[0]
+                self.assertEqual(entry["status"], "trial")
+                self.assertEqual(entry["trust_level"], "repeated_observation")
+                self.assertEqual(entry["evidence_count"], 3)
+                self.assertEqual(entry["evidence_days"], 2)
 
         asyncio.run(run())
 

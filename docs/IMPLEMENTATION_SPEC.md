@@ -4,9 +4,9 @@
 
 - 目标仓库: `/Users/lifeilong/astrbot_plugin_growth_memory`.
 - 插件名: `astrbot_plugin_growth_memory`.
-- 中文名: `成长记忆`.
+- 中文名: `小本本记下来`.
 - 目标 AstrBot: 生产基线 `4.26.8`, 最低版本 `4.24.0`.
-- 当前状态: v0.1 可加载实现已完成, 已通过本地组件测试和 AstrBot 4.26.8 生命周期检查; 线上 QQ shadow 与 24 小时 soak 尚未执行.
+- 当前状态: v0.2.1 已完成可加载实现、SQLite 向前迁移、版本化 WebUI 和线上短时闭环; 24 小时 soak 仍需部署后持续观察.
 - 实施原则: 先 shadow, 再 owner learning, 最后 group/person learning.
 - 自动学习执行合同: [定时学习管线规格](SCHEDULED_LEARNING_PIPELINE.md).
 
@@ -127,7 +127,7 @@
 
 ### 2.5 查看和回滚
 
-1. Owner 在 AstrBot 插件详情页打开 `成长记忆` Dashboard.
+1. Owner 在 AstrBot 插件详情页打开 `小本本记下来` Dashboard.
 2. 在 Entries 中筛选 `task:drawing`.
 3. 打开版本时间线, 对比 version 1 和 version 2.
 4. 点击 rollback version 1.

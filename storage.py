@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS entries(
  triggers_json TEXT NOT NULL DEFAULT '[]', conflict_key TEXT NOT NULL DEFAULT '',
  status TEXT NOT NULL, trust_level TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 0,
  priority INTEGER NOT NULL DEFAULT 0, visibility TEXT NOT NULL DEFAULT 'public',
- evidence_count INTEGER NOT NULL DEFAULT 0, expires_at TEXT, version INTEGER NOT NULL DEFAULT 1,
+ evidence_count INTEGER NOT NULL DEFAULT 0, evidence_days INTEGER NOT NULL DEFAULT 0,
+ evidence_dates_json TEXT NOT NULL DEFAULT '[]', expires_at TEXT, version INTEGER NOT NULL DEFAULT 1,
  source_kind TEXT NOT NULL DEFAULT 'manual', content_hash TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_entries_runtime ON entries(status,scope_type,scope_key,priority DESC);
 CREATE TABLE IF NOT EXISTS entry_versions(
@@ -85,6 +86,10 @@ CREATE TABLE IF NOT EXISTS staged_proposals(
  proposal_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, batch_id TEXT NOT NULL, target_id TEXT NOT NULL,
  proposal_json TEXT NOT NULL, proposal_hash TEXT NOT NULL, review_status TEXT NOT NULL DEFAULT 'pending',
  reviewer_decision_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(batch_id,proposal_hash));
+CREATE TABLE IF NOT EXISTS entry_evidence_batches(
+ entry_id TEXT NOT NULL, batch_id TEXT NOT NULL, evidence_count INTEGER NOT NULL,
+ evidence_dates_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+ PRIMARY KEY(entry_id,batch_id));
 CREATE TABLE IF NOT EXISTS target_checkpoints(
  target_id TEXT PRIMARY KEY, committed_anchor_seq INTEGER NOT NULL DEFAULT 0,
  last_successful_run_id TEXT, last_successful_at TEXT, updated_at TEXT NOT NULL);
@@ -122,6 +127,18 @@ class GrowthStore:
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        columns = {
+            str(row[1])
+            for row in self.conn.execute("PRAGMA table_info(entries)").fetchall()
+        }
+        if "evidence_days" not in columns:
+            self.conn.execute(
+                "ALTER TABLE entries ADD COLUMN evidence_days INTEGER NOT NULL DEFAULT 0"
+            )
+        if "evidence_dates_json" not in columns:
+            self.conn.execute(
+                "ALTER TABLE entries ADD COLUMN evidence_dates_json TEXT NOT NULL DEFAULT '[]'"
+            )
         self.conn.commit()
 
     def close(self) -> None:
@@ -209,13 +226,50 @@ class GrowthStore:
         )
         db.commit()
 
-    def upsert_schedule(
-        self,
-        local_time: str,
-        timezone: str = "Asia/Shanghai",
-        enabled: bool = True,
-        schedule_id: str | None = None,
+    def update_schedule(
+        self, schedule_id: str, local_time: str, timezone: str, enabled: bool
     ) -> dict[str, Any]:
+        self._validate_schedule(local_time, timezone)
+        with self._lock:
+            db = self._db()
+            if not db.execute(
+                "SELECT 1 FROM learning_schedules WHERE schedule_id=?", (schedule_id,)
+            ).fetchone():
+                raise ValueError("schedule not found")
+            try:
+                db.execute(
+                    "UPDATE learning_schedules SET timezone=?,local_time=?,enabled=?,updated_at=? WHERE schedule_id=?",
+                    (timezone, local_time, int(enabled), now_iso(), schedule_id),
+                )
+                db.commit()
+            except sqlite3.IntegrityError as exc:
+                db.rollback()
+                raise ValueError("schedule time already exists") from exc
+            return dict(
+                db.execute(
+                    "SELECT * FROM learning_schedules WHERE schedule_id=?",
+                    (schedule_id,),
+                ).fetchone()
+            )
+
+    def delete_schedule(self, schedule_id: str) -> bool:
+        with self._lock:
+            db = self._db()
+            if (
+                int(db.execute("SELECT COUNT(*) FROM learning_schedules").fetchone()[0])
+                <= 1
+            ):
+                raise ValueError(
+                    "at least one learning schedule is required; disable it instead"
+                )
+            deleted = db.execute(
+                "DELETE FROM learning_schedules WHERE schedule_id=?", (schedule_id,)
+            ).rowcount
+            db.commit()
+            return bool(deleted)
+
+    @staticmethod
+    def _validate_schedule(local_time: str, timezone: str) -> None:
         if not isinstance(timezone, str) or not timezone.strip():
             raise ValueError("timezone must not be empty")
         try:
@@ -236,6 +290,15 @@ class GrowthStore:
             and 0 <= int(minute) < 60
         ):
             raise ValueError("invalid local_time")
+
+    def upsert_schedule(
+        self,
+        local_time: str,
+        timezone: str = "Asia/Shanghai",
+        enabled: bool = True,
+        schedule_id: str | None = None,
+    ) -> dict[str, Any]:
+        self._validate_schedule(local_time, timezone)
         db = self._db()
         stamp = now_iso()
         sid = schedule_id or str(uuid.uuid4())
@@ -417,12 +480,23 @@ class GrowthStore:
             .fetchall()
         ]
 
-    def entries(self) -> list[dict[str, Any]]:
+    def entries(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
+        where = "" if include_archived else "WHERE status != 'archived'"
         return [
             dict(r)
             for r in self._db()
+            .execute(f"SELECT * FROM entries {where} ORDER BY updated_at DESC")
+            .fetchall()
+        ]
+
+    def entry_versions(self, entry_id: str) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self._db()
             .execute(
-                "SELECT * FROM entries WHERE status != 'archived' ORDER BY updated_at DESC"
+                "SELECT version,mutation_kind,actor_key,reason,created_at FROM entry_versions "
+                "WHERE entry_id=? ORDER BY version DESC",
+                (entry_id,),
             )
             .fetchall()
         ]
@@ -484,6 +558,21 @@ class GrowthStore:
             [value.strip()[:64] for value in raw_triggers[:20] if value.strip()],
             ensure_ascii=False,
         )
+        raw_evidence_dates = data.get("evidence_dates")
+        if raw_evidence_dates is None:
+            try:
+                raw_evidence_dates = json.loads(
+                    str(data.get("evidence_dates_json", "[]"))
+                )
+            except (TypeError, ValueError):
+                raw_evidence_dates = []
+        if not isinstance(raw_evidence_dates, list) or any(
+            not isinstance(value, str) for value in raw_evidence_dates
+        ):
+            raise ValueError("evidence_dates must be a list of strings")
+        evidence_dates = sorted(
+            {value.strip()[:10] for value in raw_evidence_dates if value.strip()}
+        )
         digest = __import__("hashlib").sha256(content.encode("utf-8")).hexdigest()
         params = (
             eid,
@@ -500,6 +589,8 @@ class GrowthStore:
             int(data.get("priority", 0)),
             visibility,
             int(data.get("evidence_count", 0)),
+            int(data.get("evidence_days", len(evidence_dates))),
+            json.dumps(evidence_dates, ensure_ascii=False),
             data.get("expires_at"),
             version,
             str(data.get("source_kind", "manual")),
@@ -508,8 +599,8 @@ class GrowthStore:
             stamp,
         )
         db.execute(
-            """INSERT INTO entries(entry_id,scope_type,scope_key,kind,title,content,triggers_json,conflict_key,status,trust_level,confidence,priority,visibility,evidence_count,expires_at,version,source_kind,content_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-          ON CONFLICT(entry_id) DO UPDATE SET scope_type=excluded.scope_type,scope_key=excluded.scope_key,kind=excluded.kind,title=excluded.title,content=excluded.content,triggers_json=excluded.triggers_json,conflict_key=excluded.conflict_key,status=excluded.status,trust_level=excluded.trust_level,confidence=excluded.confidence,priority=excluded.priority,visibility=excluded.visibility,evidence_count=excluded.evidence_count,expires_at=excluded.expires_at,version=excluded.version,source_kind=excluded.source_kind,content_hash=excluded.content_hash,updated_at=excluded.updated_at""",
+            """INSERT INTO entries(entry_id,scope_type,scope_key,kind,title,content,triggers_json,conflict_key,status,trust_level,confidence,priority,visibility,evidence_count,evidence_days,evidence_dates_json,expires_at,version,source_kind,content_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(entry_id) DO UPDATE SET scope_type=excluded.scope_type,scope_key=excluded.scope_key,kind=excluded.kind,title=excluded.title,content=excluded.content,triggers_json=excluded.triggers_json,conflict_key=excluded.conflict_key,status=excluded.status,trust_level=excluded.trust_level,confidence=excluded.confidence,priority=excluded.priority,visibility=excluded.visibility,evidence_count=excluded.evidence_count,evidence_days=excluded.evidence_days,evidence_dates_json=excluded.evidence_dates_json,expires_at=excluded.expires_at,version=excluded.version,source_kind=excluded.source_kind,content_hash=excluded.content_hash,updated_at=excluded.updated_at""",
             params,
         )
         db.execute(
@@ -529,6 +620,126 @@ class GrowthStore:
         db.commit()
         return dict(
             db.execute("SELECT * FROM entries WHERE entry_id=?", (eid,)).fetchone()
+        )
+
+    def register_entry_evidence(
+        self,
+        entry_id: str,
+        batch_id: str,
+        evidence_count: int,
+        evidence_dates: list[str],
+        base_count: int = 0,
+        base_dates: list[str] | None = None,
+    ) -> tuple[int, list[str]]:
+        dates = sorted({str(value)[:10] for value in evidence_dates if value})
+        with self._lock:
+            db = self._db()
+            if not db.execute(
+                "SELECT 1 FROM entry_evidence_batches WHERE entry_id=? LIMIT 1",
+                (entry_id,),
+            ).fetchone() and (base_count > 0 or base_dates):
+                db.execute(
+                    "INSERT OR IGNORE INTO entry_evidence_batches(entry_id,batch_id,evidence_count,evidence_dates_json,created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (
+                        entry_id,
+                        f"legacy:{entry_id}",
+                        max(0, int(base_count)),
+                        json.dumps(sorted(set(base_dates or [])), ensure_ascii=False),
+                        now_iso(),
+                    ),
+                )
+            db.execute(
+                "INSERT OR IGNORE INTO entry_evidence_batches(entry_id,batch_id,evidence_count,evidence_dates_json,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (
+                    entry_id,
+                    batch_id,
+                    max(0, int(evidence_count)),
+                    json.dumps(dates, ensure_ascii=False),
+                    now_iso(),
+                ),
+            )
+            rows = db.execute(
+                "SELECT evidence_count,evidence_dates_json FROM entry_evidence_batches WHERE entry_id=?",
+                (entry_id,),
+            ).fetchall()
+            db.commit()
+        total = sum(int(row["evidence_count"]) for row in rows)
+        all_dates: set[str] = set()
+        for row in rows:
+            try:
+                all_dates.update(json.loads(row["evidence_dates_json"] or "[]"))
+            except (TypeError, ValueError):
+                continue
+        return total, sorted(all_dates)
+
+    def reserve_learning_budget(
+        self,
+        budget_date: str,
+        input_tokens: int,
+        max_requests: int,
+        max_tokens: int,
+        run_id: str,
+    ) -> bool:
+        with self._lock:
+            db = self._db()
+            row = db.execute(
+                "SELECT request_count,input_tokens_estimated FROM daily_budget WHERE budget_date=?",
+                (budget_date,),
+            ).fetchone()
+            requests = int(row[0]) if row else 0
+            tokens = int(row[1]) if row else 0
+            if requests + 1 > max_requests or tokens + input_tokens > max_tokens:
+                return False
+            stamp = now_iso()
+            db.execute(
+                "INSERT INTO daily_budget(budget_date,request_count,input_tokens_estimated,updated_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(budget_date) DO UPDATE SET "
+                "request_count=excluded.request_count,input_tokens_estimated=excluded.input_tokens_estimated,updated_at=excluded.updated_at",
+                (budget_date, requests + 1, tokens + input_tokens, stamp),
+            )
+            db.execute(
+                "UPDATE learning_runs SET request_count=request_count+1,"
+                "input_tokens_estimated=input_tokens_estimated+?,updated_at=? WHERE run_id=?",
+                (input_tokens, stamp, run_id),
+            )
+            db.commit()
+            return True
+
+    def record_learning_output(
+        self, budget_date: str, run_id: str, output_tokens: int
+    ) -> None:
+        if output_tokens <= 0:
+            return
+        with self._lock:
+            db = self._db()
+            stamp = now_iso()
+            db.execute(
+                "UPDATE daily_budget SET output_tokens_actual=output_tokens_actual+?,updated_at=? WHERE budget_date=?",
+                (output_tokens, stamp, budget_date),
+            )
+            db.execute(
+                "UPDATE learning_runs SET output_tokens_actual=output_tokens_actual+?,updated_at=? WHERE run_id=?",
+                (output_tokens, stamp, run_id),
+            )
+            db.commit()
+
+    def daily_budget(self, budget_date: str) -> dict[str, Any]:
+        row = (
+            self._db()
+            .execute("SELECT * FROM daily_budget WHERE budget_date=?", (budget_date,))
+            .fetchone()
+        )
+        return (
+            dict(row)
+            if row
+            else {
+                "budget_date": budget_date,
+                "request_count": 0,
+                "input_tokens_estimated": 0,
+                "output_tokens_actual": 0,
+            }
         )
 
     def rollback_entry(

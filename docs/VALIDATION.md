@@ -13,8 +13,8 @@
 - [x] 在 AstrBot `uv` 环境导入 `GrowthMemory`.
 - [x] 注册 9 个 handler.
 - [x] 确认 capture filters 顺序为 `TargetCaptureFilter -> EventMessageTypeFilter`.
-- [x] 完成 `initialize -> terminate`, 创建 10 个 Web API route, 停止 ticker, 清理 route.
-- [x] 通过 43 项 `unittest`.
+- [x] 完成 `initialize -> terminate`, 创建 12 个 Web API route, 停止 ticker, 清理 route.
+- [x] 通过 45 项 `unittest`.
 - [x] 通过 `ruff check .`.
 - [x] 通过 `ruff format --check .`.
 - [x] 通过 `python3 -m compileall -q .`.
@@ -32,30 +32,35 @@
 - [x] 验证聊天 hook 不等待 SQLite, writer 迟到时仍能绑定最终答案.
 - [x] 验证 anchor hook 内存状态 TTL 回收, 不随问答次数无限增长.
 - [x] 验证 Reviewer 不能依据模型自报的 trust 修改人工条目.
+- [x] 验证旧版 `entries` 表迁移新增证据字段和 `entry_evidence_batches` 表可重复执行且保留历史条目.
+- [x] 验证最后一个学习时间点不能删除, 需要停用时不破坏调度状态.
+- [x] 验证人物 `user` scope 输出安全归一化为 `person`, 跨 2 天、至少 3 条证据才进入 `trial`.
+- [x] 验证 Plugin Page 桌面/390px 移动端无横向溢出, 弹窗可滚动, 暗色主题变量和禁用态可读.
 - [x] 完成 2,000 条上下文和 40 个关键事件的有界 writer 压力探针, 队列清空且 SQLite 无异常.
 
 ## 京东云基础部署证据
 
-2026-08-08 已将 GitHub `main` 的 `08079280c2bcd389293f60143b5506c63d15b182` 部署到 `/opt/1panel/apps/astrbot/astrbot/data/plugins/astrbot_plugin_growth_memory`.
+2026-08-08 已将 GitHub `main` 的 `980fc028d7276b51dd63224fb0f876305fe44849` 部署到 `/opt/1panel/apps/astrbot/astrbot/data/plugins/astrbot_plugin_growth_memory`; 本轮 `v0.2.1` 发布后会更新为新 SHA.
 
 - 变更前备份: `/opt/1panel/apps/astrbot/astrbot/data/backups/astrbot_plugin_growth_memory/20260808-184301`.
-- AstrBot 日志确认加载 `v0.2.0`、作者 `木有知`, 并完成 `GrowthMemory.initialize`.
+- AstrBot 日志确认加载 `v0.2.0`、作者 `木有知`, 并完成 `GrowthMemory.initialize`; 本轮部署后应确认 `v0.2.1`.
 - `astrbot` 重启计数为 `0`, 状态为 `running`; NapCat 未重启且仍为 `running`.
 - 插件 SQLite 位于 `/opt/1panel/apps/astrbot/astrbot/data/plugin_data/astrbot_plugin_growth_memory/growth_memory.db`, `PRAGMA integrity_check=ok`, `journal_mode=wal`.
 - 初始运行状态为 0 个学习目标、0 条消息、0 个 anchor、0 个条目, 自动创建 1 个 `03:00 Asia/Shanghai` 时间点.
 - 未认证访问管理 API 返回 `401`, 说明管理接口没有裸奔.
+- 已完成真实 Extractor + Reviewer 双阶段运行: 5 个 anchor 提交, 2 次 provider 调用成功, 当日预算记录 `2 requests / 1370 estimated input tokens`, 并验证模型 `user` scope 被归一化为 `person` 草稿条目.
 
 上述是安装和启动证据, 不是生产稳定结论. Dashboard 页面需要使用现有 AstrBot 管理账号登录后打开 `小本本记下来`; 未在服务器上绕过认证重置密码.
 
 ## 部署后必须验证
 
-- [ ] 在京东云 AstrBot WebUI 安装并 reload, 确认插件卡片和 `小本本记下来` Page 可打开.
+- [x] 在京东云 AstrBot WebUI 受保护 Plugin Page API 确认插件页面、管理命令和全部 hook 已被 AstrBot 4.27.1 发现; 浏览器页面需要管理账号登录后查看.
 - [ ] 在一个测试 QQ 私聊发送 `/进化`, 验证 target 落库且普通回复不受影响.
 - [ ] 在一个测试群观察未 @ Bot 的 context 消息只捕获、不触发 LLM 回复.
 - [ ] 完成一次真实流式和一次非流式问答, 验证 anchor question/answer.
-- [ ] 执行一次真实 Extractor + Reviewer run, 核对 provider 请求数和 token 预算.
+- [x] 执行一次真实 Extractor + Reviewer run, 核对 provider 请求数和 token 预算.
 - [ ] 在下一轮聊天检查条目实际注入并确认没有泄露 `behavior_only` 内容.
-- [ ] reload 插件, 验证 target, schedule, runtime flags, deferred review 和条目均恢复.
+- [ ] 部署 `v0.2.1` 后 reload 插件, 验证 target, `03:00/20:00` schedule, runtime flags, deferred review 和条目均恢复.
 - [ ] 连续运行 24 小时, 检查 event loop latency, queue depth, WAL 大小, memory, provider 错误和 QQ 收发.
 
 只有上述部署后检查完成, 才能把状态从“本地可加载实现”提升为“生产验证完成”.

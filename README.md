@@ -13,6 +13,7 @@
 - 聊天 hook 不等待 SQLite; anchor 迟到时用内存 pending completion 补绑定, 1 小时 TTL 回收 abandoned state.
 - 未产生最终回答的 `missing/retryable` anchor 超过 2 小时自动取消, 防止异常或并发锁造成长期堆积.
 - 条目使用追加版本, WebUI 支持查看、编辑和回滚.
+- WebUI 可维护主人身份、学习目标和多个时间点, 展示真实预算/队列/证据天数, 支持归档和从历史版本选择回滚.
 - Reviewer 的 trust/status 由服务端依据 owner 原话和重复证据推导, 自动学习不能改写人工条目.
 - 单轮注入默认最多 800 估算 token, 只使用内存 snapshot, 不在聊天热路径调用学习模型.
 - 原始消息默认保留 14 天; 未完成 anchor 的问题和答案不按普通 TTL 删除.
@@ -45,9 +46,9 @@ ruff format --check .
 python3 -m compileall -q .
 ```
 
-当前实现通过 43 项离线和组件集成测试, 并在 AstrBot 4.26.8 的 `uv` 环境完成真实 import、handler registry 和 `initialize -> terminate` 生命周期检查; 另完成 2,000 条上下文和 40 个关键事件的 writer 压力探针. 详细证据见 [验证记录](docs/VALIDATION.md).
+当前实现通过 45 项离线和组件集成测试, 并在 AstrBot 4.26.8 的 `uv` 环境完成真实 import、handler registry 和 `initialize -> terminate` 生命周期检查; 另完成 2,000 条上下文和 40 个关键事件的 writer 压力探针. 详细证据见 [验证记录](docs/VALIDATION.md).
 
-本地验证不能替代线上 QQ shadow 和 24 小时 soak. 部署到京东云后应先只开启一个低风险会话, 检查次日学习 run、实际注入、provider 消耗和 reload 恢复, 再逐步扩大 target.
+京东云已完成插件初始化、SQLite 完整性、受保护 Plugin Page API、真实 Extractor + Reviewer 双阶段运行和 reload 前的服务健康检查; 这不是 24 小时 soak 结论. 仍应连续观察队列、WAL、provider 消耗、实际注入和 QQ 收发, 再逐步扩大 target.
 
 ## 设计文档
 
@@ -55,3 +56,4 @@ python3 -m compileall -q .
 - [工程实施规格](docs/IMPLEMENTATION_SPEC.md)
 - [定时学习管线规格](docs/SCHEDULED_LEARNING_PIPELINE.md)
 - [验证记录](docs/VALIDATION.md)
+- [变更记录](CHANGELOG.md)
