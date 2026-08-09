@@ -1,5 +1,11 @@
 # 变更记录
 
+## v0.4.1
+
+- 重做 Plugin Page 视觉系统: 冷青控制台底色、珊瑚动作色、编辑型标题字体和更清晰的状态层级.
+- 优化亮色/暗色模式、指标卡、表格 hover、表单 focus、弹窗和移动端间距; 保留现有桥接 API、响应式布局、reduced-motion 和可访问性契约.
+- 加入克制的 transform/opacity 入场动效和统一 premium cubic-bezier, 不在滚动热路径做布局动画.
+
 ## v0.4.0
 
 - Extractor 明确接收主人身份、发送者显示名和 `is_owner` 标记; Reviewer 现在按独立 token 分区同时接收候选、原始证据和相关现有条目, 不再盲审模型摘要.
