@@ -55,20 +55,6 @@ graph TB
     style A fill:#e1f5e1
     style O fill:#ffe1e1
     style S fill:#e1e5ff
-    
-    subgraph "白名单管理"
-    T[/进化 - 开启学习] -.-> B
-    U[/停止进化 - 停止学习] -.-> B
-    V[WebUI 管理界面] -.-> B
-    end
-    
-    subgraph "记忆层级 (优先级)"
-    W[owner: 主人专属]
-    X[group: 当前群]
-    Y[person: 特定用户]
-    Z[task: 特定任务]
-    AA[global: 全局规则]
-    end
 ```
 
 ### 核心流程说明
