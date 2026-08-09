@@ -10,8 +10,10 @@
 
 ```
 用户: "记住，以后画图不要偏黄"
-Bot: 已记住
+Bot: 好的，规则已保存
 ```
+
+- 工具返回简短确认信息，由对话 LLM 生成自然回复
 
 - 适用于 `owner` / `task` / `global` 层级的 `behavior_rule`
 - 信任级别自动设为 `owner_explicit`

@@ -802,7 +802,7 @@ class GrowthMemory(Star):
                 .fetchone()
             )
             if existing:
-                return "已记住"
+                return ""
 
             try:
                 entry = self.store.save_entry(
@@ -833,11 +833,13 @@ class GrowthMemory(Star):
                     {"trust": "owner_explicit", "scope": scope_value},
                 )
 
-                expire_hint = f" ({expires_days}天后过期)" if expires_days > 0 else ""
-                return f"已记住{expire_hint}"
+                expire_hint = (
+                    f", {expires_days}天后自动清理" if expires_days > 0 else ""
+                )
+                return f"规则已保存{expire_hint}"
             except Exception as exc:
                 logger.exception("[%s] fast path entry creation failed", PLUGIN_NAME)
-                return f"写入失败: {exc}"
+                return f"保存失败: {exc}"
 
         # 原有审核流程
         if not is_owner and scope_value in {
@@ -924,9 +926,9 @@ class GrowthMemory(Star):
             {"target_id": target_id, "status": row["status"]},
         )
         if row.get("_duplicate") or row["status"] in {"committed", "rejected"}:
-            return f"这条记忆候选之前已经处理过, 当前状态: {row['status']}."
-        expire_hint = f", 设定 {expires_days} 天后过期" if expires_days > 0 else ""
-        return f"已记录为待审核记忆候选 {candidate_id[:12]}, 将在下一次学习批次交给 Reviewer 筛选, 尚未写入正式记忆{expire_hint}."
+            return ""
+        expire_hint = f", {expires_days}天后自动清理" if expires_days > 0 else ""
+        return f"候选已记录{expire_hint}"
 
     @filter.on_llm_request(priority=10**9)
     async def on_llm_request(self, event: Any, req: Any) -> None:

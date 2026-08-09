@@ -1540,8 +1540,8 @@ class PluginRuntimeTests(unittest.TestCase):
                     confidence=0.9,
                 )
                 # 主人 + 强意图 + behavior_rule + task scope 走快速通道
-                self.assertIn("已记住", first)
-                self.assertIn("已记住", second)  # 第二次调用检测到重复
+                self.assertIn("规则已保存", first)
+                self.assertEqual("", second)  # 第二次调用检测到重复，返回空字符串
                 # 快速通道直接写入 entries 表，不写 candidates
                 self.assertEqual(
                     plugin.store._db()
