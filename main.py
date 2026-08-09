@@ -1020,9 +1020,101 @@ class GrowthMemory(Star):
     async def learning_status(self, event: Any) -> None:
         target_id = self._target_for_event(event)
         counts = self.store.counts()
-        await event.send(
-            f"成长记忆: target={'未开启' if not target_id else target_id}, anchors={counts['trigger_anchors']}, entries={counts['entries']}, degraded={self.capture.degraded}, last_error={self.pipeline.last_error or 'none'}"
-        )
+
+        # 基本状态
+        lines = ["📊 学习状态\n"]
+        lines.append(f"🎯 当前会话: {'已开启' if target_id else '未开启'}")
+        lines.append(f"📝 已学到: {counts['entries']} 条记忆")
+
+        # 分类统计
+        scope_counts = {}
+        for row in self.store.entries():
+            scope_type = row.get("scope_type", "unknown")
+            scope_counts[scope_type] = scope_counts.get(scope_type, 0) + 1
+
+        if scope_counts:
+            lines.append("")
+            scope_names = {
+                "owner": "主人规则",
+                "task": "任务规则",
+                "group": "群画像",
+                "person": "人物画像",
+                "global": "全局规则",
+            }
+            for scope, count in sorted(
+                scope_counts.items(), key=lambda x: x[1], reverse=True
+            ):
+                lines.append(f"  └ {scope_names.get(scope, scope)}: {count} 条")
+
+        # 当前注入的记忆
+        if target_id:
+            from .runtime import render_injection
+
+            text, entry_ids, tokens = render_injection(
+                self._snapshot,
+                event,
+                int(self.config.get("injection_token_budget", 800) or 800),
+            )
+
+            if entry_ids:
+                lines.append("\n💭 当前生效的记忆:")
+                injected_entries = [
+                    e for e in self._snapshot.entries if e.entry_id in entry_ids
+                ]
+
+                # 按作用域分组
+                grouped = {}
+                for entry in injected_entries[:10]:  # 最多显示 10 条
+                    scope_label = {
+                        "owner": "主人规则",
+                        "task": "任务规则",
+                        "group": "群画像",
+                        "person": "人物画像",
+                        "global": "全局规则",
+                    }.get(entry.scope_type.value, entry.scope_type.value)
+
+                    if entry.scope_type.value == "task" and entry.triggers:
+                        scope_label += f"·{entry.triggers[0]}"
+
+                    content = (
+                        entry.content[:30] + "..."
+                        if len(entry.content) > 30
+                        else entry.content
+                    )
+                    grouped.setdefault(scope_label, []).append(content)
+
+                for scope_label, contents in grouped.items():
+                    for content in contents:
+                        lines.append(f"  [{scope_label}] {content}")
+
+                if len(entry_ids) > 10:
+                    lines.append(f"  ... 还有 {len(entry_ids) - 10} 条")
+
+                lines.append(f"\n📊 注入统计: {len(entry_ids)} 条, {tokens} tokens")
+
+        # 学习计划
+        schedules = self.store.schedules()
+        if schedules:
+            enabled_schedules = [s for s in schedules if s.get("enabled")]
+            if enabled_schedules:
+                next_time = enabled_schedules[0]["local_time"]
+                lines.append(f"\n⏰ 下次学习: 每天 {next_time}")
+
+        # 待学习队列
+        if target_id:
+            ready_count = len(self.store.ready_anchors(now_iso(), 100))
+            if ready_count > 0:
+                lines.append(f"📦 待学习: {ready_count} 个对话")
+
+        # 运行状态
+        if self.capture.degraded:
+            lines.append("\n⚠️ 队列过载，暂停学习")
+        elif self.pipeline.last_error:
+            lines.append(f"\n⚠️ 上次学习失败: {self.pipeline.last_error}")
+        else:
+            lines.append("\n✅ 运行正常")
+
+        await event.send("\n".join(lines))
 
     async def _command_target(self, event: Any, enabled: bool) -> None:
         platform, account, chat_type, peer, *_ = event_identity(event)
