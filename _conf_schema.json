@@ -32,14 +32,32 @@
   "daily_request_budget": {
     "type": "int",
     "description": "每日学习请求上限",
-    "default": 8,
-    "slider": {"min": 1, "max": 32, "step": 1}
+    "default": 64,
+    "slider": {"min": 1, "max": 128, "step": 1}
   },
   "daily_input_token_budget": {
     "type": "int",
     "description": "每日学习输入 token 估算上限",
-    "default": 16000,
-    "slider": {"min": 2000, "max": 64000, "step": 1000}
+    "default": 1000000,
+    "slider": {"min": 2000, "max": 1000000, "step": 1000}
+  },
+  "daily_output_token_budget": {
+    "type": "int",
+    "description": "每日学习输出 token 硬上限",
+    "default": 1000000,
+    "slider": {"min": 1000, "max": 1000000, "step": 1000}
+  },
+  "learning_input_token_limit": {
+    "type": "int",
+    "description": "单次 Extractor 或 Reviewer 最大输入 token",
+    "default": 32000,
+    "slider": {"min": 1000, "max": 1000000, "step": 1000}
+  },
+  "learning_max_output_tokens": {
+    "type": "int",
+    "description": "单次 Extractor 或 Reviewer 最大输出 token",
+    "default": 32768,
+    "slider": {"min": 256, "max": 1000000, "step": 256}
   },
   "injection_token_budget": {
     "type": "int",

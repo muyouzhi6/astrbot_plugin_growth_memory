@@ -146,11 +146,17 @@ RUNTIME_SETTING_KEYS = {
     "reviewer_provider_id",
     "daily_request_budget",
     "daily_input_token_budget",
+    "daily_output_token_budget",
+    "learning_input_token_limit",
+    "learning_max_output_tokens",
     "injection_token_budget",
 }
 RUNTIME_SETTING_LIMITS = {
-    "daily_request_budget": (1, 32),
-    "daily_input_token_budget": (2000, 64000),
+    "daily_request_budget": (1, 128),
+    "daily_input_token_budget": (2000, 1000000),
+    "daily_output_token_budget": (1000, 1000000),
+    "learning_input_token_limit": (1000, 1000000),
+    "learning_max_output_tokens": (256, 1000000),
     "injection_token_budget": (128, 2400),
 }
 SAFE_RUNTIME_DEFAULTS = {
@@ -159,8 +165,11 @@ SAFE_RUNTIME_DEFAULTS = {
     "llm_note_enabled": True,
     "extractor_provider_id": "",
     "reviewer_provider_id": "",
-    "daily_request_budget": 8,
-    "daily_input_token_budget": 16000,
+    "daily_request_budget": 64,
+    "daily_input_token_budget": 1000000,
+    "daily_output_token_budget": 1000000,
+    "learning_input_token_limit": 32000,
+    "learning_max_output_tokens": 32768,
     "injection_token_budget": 800,
 }
 
@@ -205,7 +214,7 @@ class GrowthMemory(Star):
         self._anchor_state_started_at: dict[str, float] = {}
         self._pending_completions: dict[str, tuple[str, str, str, str]] = {}
         self._routes: list[tuple[str, list[str]]] = []
-        self._target_ids: dict[str, str] = {}
+        self._target_ids: dict[str, tuple[str, bool]] = {}
         self._initialized = False
 
     async def initialize(self) -> None:
@@ -233,9 +242,18 @@ class GrowthMemory(Star):
             "llm_note_enabled": self.config.get("llm_note_enabled", True),
             "extractor_provider_id": self.config.get("extractor_provider_id", ""),
             "reviewer_provider_id": self.config.get("reviewer_provider_id", ""),
-            "daily_request_budget": self.config.get("daily_request_budget", 8),
+            "daily_request_budget": self.config.get("daily_request_budget", 64),
             "daily_input_token_budget": self.config.get(
-                "daily_input_token_budget", 16000
+                "daily_input_token_budget", 1000000
+            ),
+            "daily_output_token_budget": self.config.get(
+                "daily_output_token_budget", 1000000
+            ),
+            "learning_input_token_limit": self.config.get(
+                "learning_input_token_limit", 32000
+            ),
+            "learning_max_output_tokens": self.config.get(
+                "learning_max_output_tokens", 32768
             ),
             "injection_token_budget": self.config.get("injection_token_budget", 800),
         }
@@ -284,7 +302,7 @@ class GrowthMemory(Star):
                 enabled=bool(row["enabled"]),
             )
             targets.append(target)
-            target_ids[target.key] = row["target_id"]
+            target_ids[target.key] = (row["target_id"], bool(row["enabled"]))
         entries = []
         for row in self.store.entries():
             try:
@@ -381,7 +399,11 @@ class GrowthMemory(Star):
         platform, account, chat_type, peer, *_ = event_identity(event)
         key = f"{platform}:{account or '*'}:{chat_type}:{peer}"
         wildcard = f"{platform}:*:{chat_type}:{peer}"
-        return self._target_ids.get(key) or self._target_ids.get(wildcard)
+        exact = self._target_ids.get(key)
+        if exact is not None:
+            return exact[0] if exact[1] else None
+        fallback = self._target_ids.get(wildcard)
+        return fallback[0] if fallback and fallback[1] else None
 
     def _event_key(self, event: Any) -> str:
         obj = getattr(event, "message_obj", None)
@@ -777,6 +799,9 @@ class GrowthMemory(Star):
             "confidence": confidence_value,
             "evidence_ids": [evidence["row_id"]],
             "signal_type": "model_reflection",
+            "conflict_key": self.pipeline._automatic_conflict_key(
+                scope_value, scope_key, kind_value, content, ""
+            ),
         }
         candidate_key = json.dumps(
             {
@@ -810,23 +835,33 @@ class GrowthMemory(Star):
     async def on_llm_request(self, event: Any, req: Any) -> None:
         if not HAS_WAITING_LLM_HOOK:
             await self.on_waiting_llm_request(event)
-        text, _ids, _tokens = render_injection(
+        text, entry_ids, tokens = render_injection(
             self._snapshot,
             event,
             int(self.config.get("injection_token_budget", 800) or 800),
         )
         if not text:
             return
+        injected = False
         if hasattr(req, "extra_user_content_parts") and TextPart is not None:
             part = TextPart(text=text)
             if hasattr(part, "mark_as_temp"):
                 part = part.mark_as_temp()
             req.extra_user_content_parts.append(part)
+            injected = True
         elif hasattr(req, "system_prompt"):
             current = str(getattr(req, "system_prompt", "") or "").strip()
             req.system_prompt = f"{current}\n\n{text}".strip()
+            injected = True
         elif hasattr(req, "prompt"):
             req.prompt = f"{getattr(req, 'prompt', '')}\n\n{text}".strip()
+            injected = True
+        if injected:
+            session_id = event_identity(event)[-1] or self._event_key(event)
+            try:
+                self.store.record_injection(session_id, entry_ids, tokens)
+            except Exception:
+                logger.warning("[%s] failed to record injection audit", PLUGIN_NAME)
 
     @AGENT_COMPLETION_DECORATOR(priority=10**9)
     async def on_agent_done(self, event: Any, *args: Any) -> None:
@@ -1175,6 +1210,9 @@ class GrowthMemory(Star):
                                 "reviewer_provider_id",
                                 "daily_request_budget",
                                 "daily_input_token_budget",
+                                "daily_output_token_budget",
+                                "learning_input_token_limit",
+                                "learning_max_output_tokens",
                                 "injection_token_budget",
                             )
                         }

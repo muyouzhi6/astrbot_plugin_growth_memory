@@ -57,15 +57,16 @@ function renderMetrics(data) {
   const counts = data.counts || {};
   const settings = state.settings || {};
   const usedBudget = data.budget || {};
-  const budget = `${usedBudget.request_count || 0}/${settings.daily_request_budget ?? 8} req`;
+  const budget = `${usedBudget.request_count || 0}/${settings.daily_request_budget ?? 64} req`;
   const rows = [
     ["学习目标", counts.learning_targets || 0, data.snapshot?.capture_enabled ? "捕获开关开启" : "捕获开关关闭"],
     ["原始消息", counts.conversation_messages || 0, "保留 14 天"],
     ["待处理 anchor", counts.pending_anchors ?? counts.trigger_anchors ?? 0, "问答证据"],
     ["待审核候选", counts.pending_tool_candidates || 0, "LLM 主动记忆"],
     ["记忆条目", counts.entries || 0, "按层级注入"],
+    ["有效注入", counts.injection_audit || 0, "保留 90 天审计"],
     ["学习运行", counts.learning_runs || 0, "含失败和补跑"],
-    ["今日预算", budget, `${(usedBudget.input_tokens_estimated || 0).toLocaleString()}/${(settings.daily_input_token_budget ?? 16000).toLocaleString()} tok`],
+    ["今日预算", budget, `入 ${(usedBudget.input_tokens_estimated || 0).toLocaleString()}/${(settings.daily_input_token_budget ?? 1000000).toLocaleString()} · 出 ${(usedBudget.output_tokens_actual || 0).toLocaleString()}/${(settings.daily_output_token_budget ?? 1000000).toLocaleString()}`],
   ];
   $("metrics").innerHTML = rows.map(([label, value, note]) => `<div class="metric"><span class="metric-label">${escapeHtml(label)}</span><strong class="metric-value">${escapeHtml(value)}</strong><span class="metric-note">${escapeHtml(note)}</span></div>`).join("");
   const pill = $("health-pill");
@@ -90,7 +91,7 @@ function renderSchedules(rows) {
 
 function renderRuns(rows) {
   if (!rows.length) { $("runs").innerHTML = '<p class="empty">还没有学习运行记录.</p>'; return; }
-  $("runs").innerHTML = `<table><thead><tr><th scope="col">时间</th><th scope="col">类型</th><th scope="col">状态</th><th scope="col">请求</th><th scope="col">输入 Token</th><th scope="col">完成</th></tr></thead><tbody>${rows.map((row) => `<tr><td>${escapeHtml(formatTime(row.created_at))}</td><td>${escapeHtml(labels[row.run_kind] || row.run_kind)}</td><td class="status-${escapeHtml(row.status)}">${escapeHtml(labels[row.status] || row.status)}</td><td>${escapeHtml(row.request_count)}</td><td>${escapeHtml(row.input_tokens_estimated)}</td><td>${escapeHtml(formatTime(row.completed_at))}</td></tr>`).join("")}</tbody></table>`;
+  $("runs").innerHTML = `<table><thead><tr><th scope="col">时间</th><th scope="col">类型</th><th scope="col">状态</th><th scope="col">请求</th><th scope="col">输入 Token</th><th scope="col">输出 Token</th><th scope="col">完成</th></tr></thead><tbody>${rows.map((row) => `<tr><td>${escapeHtml(formatTime(row.created_at))}</td><td>${escapeHtml(labels[row.run_kind] || row.run_kind)}</td><td class="status-${escapeHtml(row.status)}">${escapeHtml(labels[row.status] || row.status)}</td><td>${escapeHtml(row.request_count)}</td><td>${escapeHtml(row.input_tokens_estimated)}</td><td>${escapeHtml(row.output_tokens_actual)}</td><td>${escapeHtml(formatTime(row.completed_at))}</td></tr>`).join("")}</tbody></table>`;
 }
 
 function triggersOf(row) {
@@ -125,8 +126,11 @@ function fillSettings(settings) {
   form.reviewer_provider_id.innerHTML = providerOptions(settings.reviewer_provider_id || "", "留空复用 Extractor");
   form.extractor_provider_id.value = settings.extractor_provider_id || "";
   form.reviewer_provider_id.value = settings.reviewer_provider_id || "";
-  form.daily_request_budget.value = settings.daily_request_budget ?? 8;
-  form.daily_input_token_budget.value = settings.daily_input_token_budget ?? 16000;
+  form.daily_request_budget.value = settings.daily_request_budget ?? 64;
+  form.daily_input_token_budget.value = settings.daily_input_token_budget ?? 1000000;
+  form.daily_output_token_budget.value = settings.daily_output_token_budget ?? 1000000;
+  form.learning_input_token_limit.value = settings.learning_input_token_limit ?? 32000;
+  form.learning_max_output_tokens.value = settings.learning_max_output_tokens ?? 32768;
   form.injection_token_budget.value = settings.injection_token_budget ?? 800;
 }
 
@@ -200,7 +204,7 @@ $("settings-form").addEventListener("submit", async (event) => {
   try {
     const form = event.target;
     const ownerIdentities = form.owner_identities.value.split(/[\n,]+/).map((item) => item.trim()).filter(Boolean);
-    await api("POST", "settings", { owner_identities: ownerIdentities, capture_enabled: form.capture_enabled.checked, llm_note_enabled: form.llm_note_enabled.checked, extractor_provider_id: form.extractor_provider_id.value.trim(), reviewer_provider_id: form.reviewer_provider_id.value.trim(), daily_request_budget: Number(form.daily_request_budget.value), daily_input_token_budget: Number(form.daily_input_token_budget.value), injection_token_budget: Number(form.injection_token_budget.value) });
+    await api("POST", "settings", { owner_identities: ownerIdentities, capture_enabled: form.capture_enabled.checked, llm_note_enabled: form.llm_note_enabled.checked, extractor_provider_id: form.extractor_provider_id.value.trim(), reviewer_provider_id: form.reviewer_provider_id.value.trim(), daily_request_budget: Number(form.daily_request_budget.value), daily_input_token_budget: Number(form.daily_input_token_budget.value), daily_output_token_budget: Number(form.daily_output_token_budget.value), learning_input_token_limit: Number(form.learning_input_token_limit.value), learning_max_output_tokens: Number(form.learning_max_output_tokens.value), injection_token_budget: Number(form.injection_token_budget.value) });
     showToast("运行设置已保存");
     await load();
   } catch (error) { showToast(String(error), true); }

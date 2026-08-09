@@ -181,14 +181,21 @@ class TargetMatcher:
             return False
         chat_type = TargetChatType.GROUP if context.group_id else TargetChatType.PRIVATE
         peer_id = context.group_id or context.sender_id
-        return any(
-            target.enabled
-            and target.platform == context.platform
-            and (not target.account_id or target.account_id == context.account_id)
+        candidates = tuple(
+            target
+            for target in self.targets
+            if target.platform == context.platform
             and target.chat_type is chat_type
             and target.peer_id == peer_id
-            for target in self.targets
         )
+        exact = tuple(
+            target
+            for target in candidates
+            if target.account_id and target.account_id == context.account_id
+        )
+        if exact:
+            return any(target.enabled for target in exact)
+        return any(not target.account_id and target.enabled for target in candidates)
 
 
 @dataclass(frozen=True)
@@ -432,7 +439,11 @@ class PromotionPolicy:
         if signal is LearningSignal.REPEATED_OBSERVATION:
             if kind is EntryKind.BEHAVIOR_RULE:
                 return EntryStatus.DRAFT
-            if scope_type not in {ScopeType.GROUP, ScopeType.PERSON}:
+            if scope_type not in {
+                ScopeType.OWNER,
+                ScopeType.GROUP,
+                ScopeType.PERSON,
+            }:
                 return EntryStatus.DRAFT
             if confidence >= 0.85 and evidence_count >= 3 and evidence_days >= 2:
                 return EntryStatus.TRIAL
@@ -523,8 +534,6 @@ class ContextSelector:
         if entry.status not in {EntryStatus.TRIAL, EntryStatus.ACTIVE}:
             return False
         if entry.visibility is Visibility.OWNER_ONLY and not context.is_owner:
-            return False
-        if entry.triggers and trigger_hits == 0:
             return False
         if entry.scope_type is ScopeType.GLOBAL:
             return True

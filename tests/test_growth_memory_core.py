@@ -112,6 +112,28 @@ class TargetMatcherTests(unittest.TestCase):
         self.assertTrue(matcher.matches(context(account_id="bot-1")))
         self.assertFalse(matcher.matches(context(account_id="bot-2")))
 
+    def test_disabled_exact_target_overrides_enabled_wildcard(self) -> None:
+        matcher = TargetMatcher(
+            targets=(
+                LearningTarget(
+                    platform="qq",
+                    account_id="",
+                    chat_type=TargetChatType.GROUP,
+                    peer_id="741379052",
+                    enabled=True,
+                ),
+                LearningTarget(
+                    platform="qq",
+                    account_id="bot-1",
+                    chat_type=TargetChatType.GROUP,
+                    peer_id="741379052",
+                    enabled=False,
+                ),
+            )
+        )
+        self.assertFalse(matcher.matches(context(account_id="bot-1")))
+        self.assertTrue(matcher.matches(context(account_id="bot-2")))
+
 
 class ContextSelectorTests(unittest.TestCase):
     def test_selects_matching_scopes_and_excludes_others(self) -> None:
@@ -237,6 +259,34 @@ class ContextSelectorTests(unittest.TestCase):
         self.assertEqual(selection.system_entries, (stable,))
         self.assertEqual(selection.dynamic_entries, (dynamic,))
 
+    def test_identity_scopes_use_triggers_for_ranking_not_admission(self) -> None:
+        entries = [
+            active_entry(
+                scope_type=ScopeType.GROUP,
+                scope_key="qq:group:741379052",
+                kind=EntryKind.PROFILE_FACT,
+                content="群聊风格",
+                triggers=("完全不相关",),
+            ),
+            active_entry(
+                scope_type=ScopeType.PERSON,
+                scope_key=OWNER_KEY,
+                kind=EntryKind.PROFILE_FACT,
+                content="人物事实",
+                triggers=("另一个话题",),
+            ),
+            active_entry(
+                scope_type=ScopeType.TASK,
+                scope_key="coding",
+                content="任务规则",
+                triggers=("写代码",),
+            ),
+        ]
+        selected = ContextSelector().select(entries, context()).entries
+        self.assertEqual(
+            {entry.content for entry in selected}, {"群聊风格", "人物事实"}
+        )
+
 
 class LearningPolicyTests(unittest.TestCase):
     def test_owner_explicit_instruction_activates_immediately(self) -> None:
@@ -255,6 +305,17 @@ class LearningPolicyTests(unittest.TestCase):
             signal=LearningSignal.REPEATED_OBSERVATION,
             kind=EntryKind.PROFILE_FACT,
             scope_type=ScopeType.GROUP,
+            confidence=0.9,
+            evidence_count=3,
+            evidence_days=2,
+        )
+        self.assertEqual(status, EntryStatus.TRIAL)
+
+    def test_repeated_owner_observation_can_enter_trial(self) -> None:
+        status = PromotionPolicy.decide(
+            signal=LearningSignal.REPEATED_OBSERVATION,
+            kind=EntryKind.PROFILE_FACT,
+            scope_type=ScopeType.OWNER,
             confidence=0.9,
             evidence_count=3,
             evidence_days=2,

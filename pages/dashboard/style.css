@@ -57,7 +57,7 @@ button.danger { color: var(--danger); border-color: color-mix(in srgb, var(--dan
 .pill::before { content: ""; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: currentColor; }
 .pill.warn { color: var(--warning); background: color-mix(in srgb, var(--warning) 14%, transparent); }
 .pill.error { color: var(--danger); background: color-mix(in srgb, var(--danger) 14%, transparent); }
-.metrics { display: grid; grid-template-columns: repeat(6, 1fr); gap: 1px; margin: 28px 0 20px; overflow: hidden; border: 1px solid var(--line); border-radius: 9px; background: var(--line); box-shadow: var(--shadow); }
+.metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin: 28px 0 20px; overflow: hidden; border: 1px solid var(--line); border-radius: 9px; background: var(--line); box-shadow: var(--shadow); }
 .metric { min-width: 0; padding: 17px 16px; background: var(--paper); }
 .metric-label { display: block; color: var(--muted); font-size: 12px; }
 .metric-value { display: block; margin-top: 5px; font: 650 26px/1 Georgia, serif; }

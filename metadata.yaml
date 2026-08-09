@@ -2,7 +2,7 @@ name: astrbot_plugin_growth_memory
 display_name: 小本本记下来
 short_desc: 让 AstrBot 在明确授权的会话里持续记住偏好、规则和共同经历
 desc: 显式会话白名单、定时两阶段学习与分层记忆条目维护
-version: v0.3.1
+version: v0.4.0
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_growth_memory
 astrbot_version: ">=4.24.0"

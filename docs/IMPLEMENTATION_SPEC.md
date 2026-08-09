@@ -1767,7 +1767,7 @@ DoD:
 4. 确认 `owner_identities`.
 5. 确认 `shadow_mode=true`.
 6. 确认 `learning_targets=[]`, 再只加入一个 owner 私聊和一个低流量测试群.
-7. 确认 schedule 为 `03:00 Asia/Shanghai`, 每日预算为 8 requests/16,000 input token.
+7. 确认 schedule 为 `03:00 Asia/Shanghai`, 每日预算为 64 requests/1,000,000 input token/1,000,000 output token.
 
 ### 24.2 Deploy
 

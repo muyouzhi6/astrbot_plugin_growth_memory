@@ -485,7 +485,8 @@ open -> ready -> claimed -> extracted -> reviewed -> committed
 | 限制 | 默认值 |
 |---|---:|
 | 每日 provider request | 8 |
-| 每日估算 input token | 16,000 |
+| 每日估算 input token | 1,000,000 |
+| 每日 output token | 1,000,000 |
 | Extractor 单批 anchor | 10 |
 | Extractor 单批 input token | 4,000 |
 | Extractor 单批 output token | 800 |
@@ -847,7 +848,7 @@ WebUI 不默认展示完整私聊内容. 打开 evidence 明细需要显式点�
 - 非 owner behavior rule 越权写入数为 0.
 - Stage 2 retry 重复 Stage 1 调用数为 0.
 - 无 ready anchor 的日期学习调用数为 0.
-- 每日 request <= 8, input token <= 16,000.
+- 每日 request <= 64, input token <= 1,000,000, output token <= 1,000,000.
 - 无聊天 no-reply, provider timeout 传播或 capture 导致的明显延迟.
 
 通过后再开启 owner active 自动写入. 群和人物观察仍先保持 `trial/draft`.

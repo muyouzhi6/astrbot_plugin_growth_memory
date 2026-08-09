@@ -1,5 +1,13 @@
 # 变更记录
 
+## v0.4.0
+
+- Extractor 明确接收主人身份、发送者显示名和 `is_owner` 标记; Reviewer 现在按独立 token 分区同时接收候选、原始证据和相关现有条目, 不再盲审模型摘要.
+- 修正学习目标优先级: 精确 Bot target 的关闭状态覆盖 wildcard; 修正 scope 召回语义, 仅 `task` 把 trigger 作为硬门槛, 其他层级按身份或群匹配并只用 trigger 排序.
+- 主人画像支持至少 3 条、跨 2 天重复证据进入 `trial`; 自动条目强制生成稳定 conflict key, 非 task trigger 自动清空, 敏感人物事实自动限制为 `owner_only`.
+- 新增每日输出 token、单次学习输入和单次学习输出上限, 质量优先默认档为每日 64 次请求和 1,000,000 输入/输出 token, 单次输入 32,000、输出 32,768; Provider 请求透传 `max_tokens`, 并新增真实注入审计、90 天清理和 Dashboard 输入/输出预算、注入次数展示.
+- 修复测试对 AstrBot 真实 Starlette `JSONResponse` 的兼容, 65 项回归测试覆盖证据审查、匹配、去重、权限、预算和注入审计.
+
 ## v0.3.1
 
 - 修复 `growth_memory_note` 在 AstrBot 4.27.1 / Gemini 兼容 Provider 中生成无 `items` 的数组 schema, 导致上游返回 400 后整轮消息无回复.

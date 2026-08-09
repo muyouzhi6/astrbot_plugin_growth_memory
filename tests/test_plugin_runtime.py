@@ -75,13 +75,21 @@ class FakeLLMContext:
     def __init__(self, outputs):
         self.outputs = list(outputs)
         self.calls = 0
+        self.call_args = []
 
     async def llm_generate(self, **kwargs):
         self.calls += 1
+        self.call_args.append(kwargs)
         output = self.outputs.pop(0)
         if isinstance(output, Exception):
             raise output
         return SimpleNamespace(role="assistant", completion_text=output)
+
+
+def response_data(response):
+    if hasattr(response, "data"):
+        return response.data
+    return json.loads(bytes(response.body).decode("utf-8"))
 
 
 def ready_anchor(
@@ -135,6 +143,35 @@ class PluginRuntimeTests(unittest.TestCase):
         wrong_account.message_obj.self_id = "other-bot"
         self.assertFalse(TargetCaptureFilter().filter(wrong_account, None))
         self.assertTrue(TargetCaptureFilter().filter(FakeEvent(group_id="12345"), None))
+
+    def test_disabled_exact_target_blocks_wildcard_storage_lookup(self):
+        with tempfile.TemporaryDirectory() as td:
+            plugin = GrowthMemory(FakeContext(), {"capture_enabled": True})
+            plugin.store = GrowthStore(Path(td) / "db.sqlite")
+            plugin.store.open()
+            plugin.store.upsert_target(
+                {
+                    "platform": "aiocqhttp",
+                    "account_id": "",
+                    "chat_type": "group",
+                    "peer_id": "12345",
+                    "enabled": True,
+                }
+            )
+            plugin.store.upsert_target(
+                {
+                    "platform": "aiocqhttp",
+                    "account_id": "bot",
+                    "chat_type": "group",
+                    "peer_id": "12345",
+                    "enabled": False,
+                }
+            )
+            plugin._refresh_snapshot()
+            event = FakeEvent(group_id="12345")
+            self.assertFalse(plugin.gate.matches(event))
+            self.assertIsNone(plugin._target_for_event(event))
+            plugin.store.close()
 
     def test_bounded_capture_evicts_context_before_critical(self):
         queue = BoundedCapture(2)
@@ -223,22 +260,33 @@ class PluginRuntimeTests(unittest.TestCase):
                     "source_kind": "scheduled",
                 }
             )
+            tool_draft = store.save_entry(
+                {
+                    "scope_type": "owner",
+                    "kind": "profile_fact",
+                    "content": "陈旧主动候选草稿",
+                    "status": "draft",
+                    "trust_level": "model_inference",
+                    "source_kind": "llm_tool",
+                }
+            )
             store._db().execute(
-                "UPDATE entries SET updated_at='2000-01-01T00:00:00Z' WHERE entry_id=?",
-                (draft["entry_id"],),
+                "UPDATE entries SET updated_at='2000-01-01T00:00:00Z' WHERE entry_id IN (?,?)",
+                (draft["entry_id"], tool_draft["entry_id"]),
             )
             store._db().commit()
             visible_ids = {row["entry_id"] for row in store.entries()}
             self.assertNotIn(expired["entry_id"], visible_ids)
             self.assertIn(draft["entry_id"], visible_ids)
             self.assertEqual(store.archive_expired_entries(), 1)
-            self.assertEqual(store.archive_stale_drafts("2026-01-01T00:00:00Z"), 1)
+            self.assertEqual(store.archive_stale_drafts("2026-01-01T00:00:00Z"), 2)
             archived = {
                 row["entry_id"]: row["status"]
                 for row in store.entries(include_archived=True)
             }
             self.assertEqual(archived[expired["entry_id"]], "archived")
             self.assertEqual(archived[draft["entry_id"]], "archived")
+            self.assertEqual(archived[tool_draft["entry_id"]], "archived")
 
     def test_existing_database_migration_is_idempotent_and_preserves_entries(self):
         with tempfile.TemporaryDirectory() as td:
@@ -592,9 +640,9 @@ class PluginRuntimeTests(unittest.TestCase):
             plugin.store.set_runtime_flag("daily_request_budget", 999, "manual")
             plugin._load_runtime_flags()
             self.assertFalse(plugin.config["capture_enabled"])
-            self.assertEqual(plugin.config["daily_request_budget"], 8)
+            self.assertEqual(plugin.config["daily_request_budget"], 64)
             self.assertFalse(plugin.store.runtime_flags()["capture_enabled"])
-            self.assertEqual(plugin.store.runtime_flags()["daily_request_budget"], 8)
+            self.assertEqual(plugin.store.runtime_flags()["daily_request_budget"], 64)
             plugin.store.close()
 
     def test_review_batch_compare_and_set_prevents_duplicate_provider_calls(self):
@@ -703,6 +751,16 @@ class PluginRuntimeTests(unittest.TestCase):
                 self.assertEqual(run_row["request_count"], 2)
                 self.assertGreater(run_row["input_tokens_estimated"], 0)
                 self.assertGreater(run_row["output_tokens_actual"], 0)
+                extractor_prompt = context.call_args[0]["prompt"]
+                reviewer_prompt = context.call_args[1]["prompt"]
+                self.assertIn(
+                    'owner_identities=["aiocqhttp:user:10001"]', extractor_prompt
+                )
+                self.assertIn("is_owner=true", extractor_prompt)
+                self.assertIn('"normalized_text": "以后画图不要偏黄"', reviewer_prompt)
+                self.assertIn('"is_owner": true', reviewer_prompt)
+                self.assertEqual(context.call_args[0]["max_tokens"], 32768)
+                self.assertEqual(context.call_args[1]["max_tokens"], 32768)
 
         asyncio.run(run())
 
@@ -776,6 +834,40 @@ class PluginRuntimeTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_output_budget_sets_max_tokens_and_stops_new_requests(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as td:
+                store = GrowthStore(Path(td) / "db.sqlite")
+                store.open()
+                context = FakeLLMContext(["[]"])
+                pipeline = LearningPipeline(
+                    context,
+                    store,
+                    {
+                        "daily_request_budget": 4,
+                        "daily_input_token_budget": 8000,
+                        "daily_output_token_budget": 1000,
+                        "learning_max_output_tokens": 256,
+                    },
+                    lambda: RuntimeSnapshot(TargetMatcher()),
+                )
+                run_row = pipeline._create_run("manual:output-budget", "manual")
+                self.assertIsNotNone(run_row)
+                await pipeline._call_json("review", "[]", "review", run_row["run_id"])
+                self.assertEqual(context.call_args[0]["max_tokens"], 256)
+                budget_date = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+                used = store.daily_budget(budget_date)["output_tokens_actual"]
+                store.record_learning_output(
+                    budget_date, run_row["run_id"], 1000 - int(used)
+                )
+                with self.assertRaisesRegex(RuntimeError, "budget exhausted"):
+                    await pipeline._call_json(
+                        "review", "[]", "review", run_row["run_id"]
+                    )
+                self.assertEqual(context.calls, 1)
+
+        asyncio.run(run())
+
     def test_schedule_catch_up_is_idempotent(self):
         async def run():
             with tempfile.TemporaryDirectory() as td:
@@ -828,7 +920,11 @@ class PluginRuntimeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             GrowthMemory._validate_runtime_updates({"owner_identities": ["qq:123456"]})
         GrowthMemory._validate_runtime_updates(
-            {"owner_identities": ["aiocqhttp:123456"]}
+            {
+                "owner_identities": ["aiocqhttp:123456"],
+                "learning_input_token_limit": 1000000,
+                "learning_max_output_tokens": 1000000,
+            }
         )
 
     def test_web_api_post_update_and_rollback(self):
@@ -860,7 +956,7 @@ class PluginRuntimeTests(unittest.TestCase):
                         {"local_time": "04:30", "timezone": "Asia/Shanghai"},
                     )
                     schedule_response = await plugin.web_api()
-                    schedule_id = schedule_response.data["schedule_id"]
+                    schedule_id = response_data(schedule_response)["schedule_id"]
                     self.assertEqual(schedule_response.status_code, 201)
 
                     plugin_main.request = FakeWebRequest(
@@ -869,7 +965,7 @@ class PluginRuntimeTests(unittest.TestCase):
                         {"enabled": False},
                     )
                     toggled = await plugin.web_api(schedule_id=schedule_id)
-                    self.assertFalse(toggled.data["enabled"])
+                    self.assertFalse(response_data(toggled)["enabled"])
 
                     plugin_main.request = FakeWebRequest(
                         "POST",
@@ -881,7 +977,9 @@ class PluginRuntimeTests(unittest.TestCase):
                         },
                     )
                     edited_schedule = await plugin.web_api(schedule_id=schedule_id)
-                    self.assertEqual(edited_schedule.data["local_time"], "05:15")
+                    self.assertEqual(
+                        response_data(edited_schedule)["local_time"], "05:15"
+                    )
 
                     plugin_main.request = FakeWebRequest(
                         "POST",
@@ -895,7 +993,7 @@ class PluginRuntimeTests(unittest.TestCase):
                         },
                     )
                     created = await plugin.web_api()
-                    entry_id = created.data["entry_id"]
+                    entry_id = response_data(created)["entry_id"]
 
                     plugin_main.request = FakeWebRequest(
                         "POST",
@@ -903,8 +1001,8 @@ class PluginRuntimeTests(unittest.TestCase):
                         {"content": "避免偏黄和复古滤镜"},
                     )
                     updated = await plugin.web_api(entry_id=entry_id)
-                    self.assertEqual(updated.data["kind"], "behavior_rule")
-                    self.assertEqual(updated.data["version"], 2)
+                    self.assertEqual(response_data(updated)["kind"], "behavior_rule")
+                    self.assertEqual(response_data(updated)["version"], 2)
 
                     plugin_main.request = FakeWebRequest(
                         "GET",
@@ -912,7 +1010,7 @@ class PluginRuntimeTests(unittest.TestCase):
                     )
                     versions = await plugin.web_api(entry_id=entry_id)
                     self.assertEqual(
-                        [item["version"] for item in versions.data], [2, 1]
+                        [item["version"] for item in response_data(versions)], [2, 1]
                     )
 
                     plugin_main.request = FakeWebRequest(
@@ -921,8 +1019,8 @@ class PluginRuntimeTests(unittest.TestCase):
                         {"version": 1},
                     )
                     rolled = await plugin.web_api(entry_id=entry_id)
-                    self.assertEqual(rolled.data["content"], "避免偏黄")
-                    self.assertEqual(rolled.data["version"], 3)
+                    self.assertEqual(response_data(rolled)["content"], "避免偏黄")
+                    self.assertEqual(response_data(rolled)["version"], 3)
 
                     plugin_main.request = FakeWebRequest(
                         "POST",
@@ -930,12 +1028,12 @@ class PluginRuntimeTests(unittest.TestCase):
                         {"status": "archived"},
                     )
                     archived = await plugin.web_api(entry_id=entry_id)
-                    self.assertEqual(archived.data["status"], "archived")
+                    self.assertEqual(response_data(archived)["status"], "archived")
                     plugin_main.request = FakeWebRequest(
                         "GET", "/api/plug/astrbot_plugin_growth_memory/entries"
                     )
                     visible = await plugin.web_api()
-                    self.assertEqual(visible.data[0]["entry_id"], entry_id)
+                    self.assertEqual(response_data(visible)[0]["entry_id"], entry_id)
 
                     plugin_main.request = FakeWebRequest(
                         "POST",
@@ -943,7 +1041,7 @@ class PluginRuntimeTests(unittest.TestCase):
                         {"action": "delete"},
                     )
                     deleted = await plugin.web_api(schedule_id=schedule_id)
-                    self.assertTrue(deleted.data["ok"])
+                    self.assertTrue(response_data(deleted)["ok"])
 
                     remaining = plugin.store.schedules()[0]
                     plugin_main.request = FakeWebRequest(
@@ -1036,6 +1134,108 @@ class PluginRuntimeTests(unittest.TestCase):
                 self.assertEqual(entry["evidence_days"], 2)
 
         asyncio.run(run())
+
+    def test_owner_repeated_observation_can_enter_trial(self):
+        trust = LearningPipeline._server_trust(
+            "profile_fact", "owner", ["最近又在看科幻小说"], 3, 2
+        )
+        status = LearningPipeline._server_status(
+            trust, "profile_fact", "owner", 0.9, 3, 2
+        )
+        self.assertEqual(trust, "repeated_observation")
+        self.assertEqual(status, "trial")
+
+    def test_automatic_entry_conflict_key_is_stable_and_deduplicates(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as td:
+                store = GrowthStore(Path(td) / "db.sqlite")
+                store.open()
+                target = store.upsert_target(
+                    {
+                        "platform": "aiocqhttp",
+                        "chat_type": "private",
+                        "peer_id": "10001",
+                    }
+                )
+                first = store.create_message(
+                    target["target_id"],
+                    direction="inbound",
+                    sender_key="aiocqhttp:user:10001",
+                    sender_name="owner",
+                    text="我喜欢科幻小说",
+                    session_id="s1",
+                    source="platform_inbound",
+                )
+                second = store.create_message(
+                    target["target_id"],
+                    direction="inbound",
+                    sender_key="aiocqhttp:user:10001",
+                    sender_name="owner",
+                    text="我喜欢科幻小说",
+                    session_id="s1",
+                    source="platform_inbound",
+                )
+                proposal_one = {
+                    "scope_type": "owner",
+                    "kind": "profile_fact",
+                    "content": "主人喜欢科幻小说",
+                    "triggers": ["科幻"],
+                    "confidence": 0.95,
+                    "evidence_ids": [first["row_id"]],
+                }
+                proposal_two = dict(proposal_one, evidence_ids=[second["row_id"]])
+                context = FakeLLMContext(
+                    [
+                        json.dumps([proposal_one], ensure_ascii=False),
+                        json.dumps([proposal_two], ensure_ascii=False),
+                    ]
+                )
+                snapshot = RuntimeSnapshot(
+                    TargetMatcher(),
+                    owner_identities=frozenset({"aiocqhttp:user:10001"}),
+                )
+                pipeline = LearningPipeline(context, store, {}, lambda: snapshot)
+                target_view = {
+                    "platform": "aiocqhttp",
+                    "chat_type": "private",
+                    "peer_id": "10001",
+                }
+                for batch_id, proposal, evidence in (
+                    ("dedupe-1", proposal_one, first),
+                    ("dedupe-2", proposal_two, second),
+                ):
+                    await pipeline._review_and_commit(
+                        "run-dedupe",
+                        batch_id,
+                        [],
+                        [proposal],
+                        evidence_rows_override={evidence["row_id"]: evidence},
+                        target_override=target_view,
+                        participant_keys_override={"aiocqhttp:user:10001"},
+                    )
+                entries = store.entries()
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0]["version"], 2)
+                self.assertTrue(
+                    entries[0]["conflict_key"].startswith("auto.profile_fact.")
+                )
+                self.assertEqual(json.loads(entries[0]["triggers_json"]), [])
+
+        asyncio.run(run())
+
+    def test_sensitive_person_fact_is_owner_only(self):
+        self.assertEqual(
+            LearningPipeline._automatic_visibility(
+                "person", "milestone", "她曾经遭遇 Steam 诈骗, 损失 5000 元"
+            ),
+            "owner_only",
+        )
+        self.assertEqual(
+            LearningPipeline._automatic_visibility(
+                "person", "profile_fact", "她喜欢清爽的界面"
+            ),
+            "public",
+        )
 
     def test_owner_directive_does_not_raise_unrelated_proposal_trust(self):
         async def run():
@@ -1242,6 +1442,17 @@ class PluginRuntimeTests(unittest.TestCase):
                     await plugin.on_llm_request(FakeEvent(text="帮我画图"), request)
                     self.assertEqual(len(request.extra_user_content_parts), 1)
                     self.assertTrue(request.extra_user_content_parts[0].temporary)
+                    audit = (
+                        plugin.store._db()
+                        .execute("SELECT * FROM injection_audit")
+                        .fetchone()
+                    )
+                    self.assertIsNotNone(audit)
+                    self.assertEqual(
+                        json.loads(audit["entry_ids_json"]),
+                        [plugin.store.entries()[0]["entry_id"]],
+                    )
+                    self.assertGreater(audit["estimated_tokens"], 0)
             finally:
                 plugin_main.TextPart = original_text_part
 
@@ -1497,7 +1708,7 @@ class PluginRuntimeTests(unittest.TestCase):
                     )
                     response = await plugin.web_api()
                     self.assertEqual(
-                        response.data,
+                        response_data(response),
                         [
                             {"id": "summary-fast", "name": "summary-fast"},
                             {"id": "summary-safe", "name": "summary-safe"},

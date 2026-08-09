@@ -176,7 +176,7 @@ manual > owner_explicit > owner_correction > repeated_observation > model_infere
 - 默认每天 `03:00` 执行, timezone 为 `Asia/Shanghai`. WebUI 可增删 `HH:MM` time slot, 所有 slot 共享每日预算.
 - 单个 Extractor batch 最多 10 个 anchor, 不足 10 个直接处理, 同时受 4,000 输入 token 硬上限约束.
 - Stage 1 Extractor 提取高召回 proposal. Stage 2 Reviewer 对全部 proposal 和相关现有条目做筛选, 去重与整合.
-- 每天最多 8 次学习请求和 16,000 输入 token 估算, 单 worker 并发固定为 1.
+- 质量优先默认档每天最多 64 次学习请求、1,000,000 输入 token 和 1,000,000 输出 token, 单 worker 并发固定为 1.
 - 每个 Extractor batch 准入时持久化预留一个 Reviewer request/token 额度, 防止只抽取不审查.
 - 超预算任务转为 deferred. Stage 2 失败时复用 Stage 1 结果, 不重复付费抽取.
 - 只有 reviewer decision 和本地 mutation/no-change/human-review 事务完成后才推进 target checkpoint.

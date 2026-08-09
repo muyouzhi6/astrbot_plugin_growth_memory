@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS daily_budget(
  input_tokens_estimated INTEGER NOT NULL DEFAULT 0, output_tokens_actual INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS runtime_flags(key TEXT PRIMARY KEY,value_json TEXT NOT NULL,actor_key TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS injection_audit(audit_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,entry_ids_json TEXT NOT NULL,estimated_tokens INTEGER NOT NULL,created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_injection_audit_time ON injection_audit(created_at);
 CREATE TABLE IF NOT EXISTS audit_log(audit_id TEXT PRIMARY KEY,actor_key TEXT NOT NULL,action TEXT NOT NULL,object_type TEXT NOT NULL,object_id TEXT NOT NULL,payload_json TEXT NOT NULL,created_at TEXT NOT NULL);
 """
 
@@ -880,7 +881,7 @@ class GrowthStore:
         db = self._db()
         cursor = db.execute(
             "UPDATE entries SET status='archived',updated_at=? "
-            "WHERE source_kind='scheduled' AND status='draft' AND updated_at<?",
+            "WHERE source_kind IN ('scheduled','llm_tool') AND status='draft' AND updated_at<?",
             (now_iso(), cutoff),
         )
         db.commit()
@@ -893,16 +894,29 @@ class GrowthStore:
         max_requests: int,
         max_tokens: int,
         run_id: str,
+        *,
+        max_output_tokens: int | None = None,
+        planned_output_tokens: int = 0,
     ) -> bool:
         with self._lock:
             db = self._db()
             row = db.execute(
-                "SELECT request_count,input_tokens_estimated FROM daily_budget WHERE budget_date=?",
+                "SELECT request_count,input_tokens_estimated,output_tokens_actual "
+                "FROM daily_budget WHERE budget_date=?",
                 (budget_date,),
             ).fetchone()
             requests = int(row[0]) if row else 0
             tokens = int(row[1]) if row else 0
-            if requests + 1 > max_requests or tokens + input_tokens > max_tokens:
+            output_tokens = int(row[2]) if row else 0
+            output_exhausted = (
+                max_output_tokens is not None
+                and output_tokens + max(0, planned_output_tokens) > max_output_tokens
+            )
+            if (
+                requests + 1 > max_requests
+                or tokens + input_tokens > max_tokens
+                or output_exhausted
+            ):
                 return False
             stamp = now_iso()
             db.execute(
@@ -953,6 +967,36 @@ class GrowthStore:
                 "output_tokens_actual": 0,
             }
         )
+
+    def record_injection(
+        self,
+        session_id: str,
+        entry_ids: list[str] | tuple[str, ...],
+        estimated_tokens: int,
+    ) -> str:
+        audit_id = str(uuid.uuid4())
+        with self._lock:
+            self._db().execute(
+                "INSERT INTO injection_audit(audit_id,session_id,entry_ids_json,estimated_tokens,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (
+                    audit_id,
+                    str(session_id)[:500],
+                    json.dumps(list(dict.fromkeys(entry_ids)), ensure_ascii=False),
+                    max(0, int(estimated_tokens)),
+                    now_iso(),
+                ),
+            )
+            self._db().commit()
+        return audit_id
+
+    def cleanup_injection_audit(self, cutoff: str) -> int:
+        with self._lock:
+            cursor = self._db().execute(
+                "DELETE FROM injection_audit WHERE created_at<?", (cutoff,)
+            )
+            self._db().commit()
+            return int(cursor.rowcount)
 
     def rollback_entry(
         self, entry_id: str, version: int, actor_key: str
@@ -1064,6 +1108,7 @@ class GrowthStore:
                 "entries",
                 "learning_runs",
                 "learning_batches",
+                "injection_audit",
             )
         }
         counts["pending_anchors"] = int(

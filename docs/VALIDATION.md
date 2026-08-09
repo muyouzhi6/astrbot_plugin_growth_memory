@@ -14,7 +14,7 @@
 - [x] 注册 9 个 handler.
 - [x] 确认 capture filters 顺序为 `TargetCaptureFilter -> EventMessageTypeFilter`.
 - [x] 完成 `initialize -> terminate`, 创建 13 个 Web API route, 停止 ticker, 清理 route.
-- [x] 通过 57 项 `unittest`.
+- [x] 通过 65 项 `unittest`.
 - [x] 通过 `ruff check .`.
 - [x] 通过 `ruff format --check .`.
 - [x] 通过 `python3 -m compileall -q .`.
@@ -24,10 +24,11 @@
 - [x] 验证流式答案依赖 `on_agent_done`, 错误回答不学习.
 - [x] 验证 Extractor/Reviewer 成功路径和 owner behavior rule 本地权限校验.
 - [x] 验证 Reviewer 连续失败不重跑 Extractor.
-- [x] 验证每日 request budget 和 input token budget.
+- [x] 验证每日 request/input/output token budget, 单次 `max_tokens` 和输出预算耗尽后的 fail-closed.
 - [x] 验证 schedule 12 小时 catch-up 和 slot 幂等.
 - [x] 验证 14 天 TTL 不删除仍在处理中的 anchor 证据, 且 stale missing anchor 会被取消.
 - [x] 验证注入不依赖 learning target 开关.
+- [x] 验证成功注入实际写入 `injection_audit`, 审计只包含 session、entry ID 和 token 估算.
 - [x] 验证 Web API 只使用 AstrBot Plugin Page bridge 支持的 `GET/POST`.
 - [x] 验证聊天 hook 不等待 SQLite, writer 迟到时仍能绑定最终答案.
 - [x] 验证 anchor hook 内存状态 TTL 回收, 不随问答次数无限增长.
@@ -45,6 +46,9 @@
 - [x] 验证启动时非法 SQLite runtime flag 自动修复为安全默认值.
 - [x] 验证 `growth_memory_note` 已注册到 AstrBot LLM tool registry, 只写候选队列, 同一消息确定性去重, 普通成员权限拒绝和敏感内容拦截.
 - [x] 验证 `/providers` API 从 `context.get_all_providers()` 读取 Chat Provider, 去重排序, WebUI Extractor/Reviewer 下拉可恢复已保存值并标记已下线 Provider.
+- [x] 验证 Reviewer prompt 同时包含候选引用的原始入站证据、`is_owner` 标记和现有条目, 三部分分别限额后总量不超过可配置的单次学习输入上限.
+- [x] 验证精确 disabled target 覆盖 enabled wildcard, `owner/group/person/global` trigger 只参与排序且 `task` 仍必须命中 trigger.
+- [x] 验证主人重复画像跨 2 天、至少 3 条证据进入 `trial`, 自动 conflict key 去重, 非 task trigger 清空, 敏感人物事实为 `owner_only`.
 - [x] 完成 2,000 条上下文和 40 个关键事件的有界 writer 压力探针, 队列清空且 SQLite 无异常.
 
 ## 京东云基础部署证据
