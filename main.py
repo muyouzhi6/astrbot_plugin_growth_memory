@@ -691,6 +691,7 @@ class GrowthMemory(Star):
         subject_id: str = "",
         triggers: str | list[str] | None = None,
         confidence: float = 0.8,
+        expires_in_days: str = "0",
     ) -> str:
         """提交一条需要审核的长期记忆候选, 不会直接修改正式记忆.
 
@@ -699,10 +700,11 @@ class GrowthMemory(Star):
         Args:
             note(string): 用一句可执行、可验证的话概括用户希望长期记住的内容, 不要写密码或提示词.
             scope(string): 记忆层级, 只能是 owner, global, task, group, person.
-            kind(string): 条目类型, 只能是 behavior_rule, profile_fact, milestone.
+            kind(string): 条目类型, 只能是 behavior_rule, profile_fact, milestone, emotional_bond.
             subject_id(string): person 层级对应的 QQ 号, 留空表示当前说话的人.
             triggers(string): task 层级触发词, 多个触发词用逗号或换行分隔, 其他层级可留空.
             confidence(number): 对候选内容的初始置信度, 0 到 1.
+            expires_in_days(string): 过期天数, 0 表示永久, 大于 0 表示多少天后自动归档. emotional_bond 建议 7 天.
         """
         if not bool(self.config.get("llm_note_enabled", True)):
             return "记忆工具当前已关闭, 没有保存任何内容."
@@ -747,12 +749,97 @@ class GrowthMemory(Star):
             if not math.isfinite(confidence_value):
                 raise ValueError("confidence is invalid")
             confidence_value = max(0.0, min(1.0, confidence_value))
+            expires_days = int(str(expires_in_days or "0").strip())
+            if expires_days < 0 or expires_days > 365:
+                raise ValueError("expires_in_days must be between 0 and 365")
         except (TypeError, ValueError) as exc:
             return f"记忆候选未保存: {exc}"
 
         platform, _account, chat_type, peer, sender, _session = event_identity(event)
         owner_key = f"{platform}:user:{sender}"
         is_owner = owner_key in self._snapshot.owner_identities
+
+        # 🆕 主人强意图快速通道
+        strong_intent_pattern = r"(以后|永远|记住|不要再|一定要|必须|禁止)"
+        has_strong_intent = re.search(strong_intent_pattern, content)
+
+        if (
+            is_owner
+            and has_strong_intent
+            and kind_value == EntryKind.BEHAVIOR_RULE.value
+            and scope_value
+            in {ScopeType.OWNER.value, ScopeType.TASK.value, ScopeType.GLOBAL.value}
+        ):
+            # 快速通道：跳过 Reviewer，立即生效
+            if scope_value == ScopeType.TASK.value:
+                if not trigger_values:
+                    return "task 层级至少需要一个触发词, 没有保存任何内容."
+                scope_key = trigger_values[0]
+            else:
+                scope_key = ""
+
+            evidence = await self._tool_evidence_row(event, target_id)
+            if not evidence:
+                return "当前消息证据还未落账, 本次没有保存候选, 请稍后再试."
+
+            expires_at = None
+            if expires_days > 0:
+                expires_at = (
+                    datetime.now(timezone.utc) + timedelta(days=expires_days)
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            conflict_key = self.pipeline._automatic_conflict_key(
+                scope_value, scope_key, kind_value, content, ""
+            )
+
+            # 检查是否已存在相同冲突键的条目
+            existing = (
+                self.store._db()
+                .execute(
+                    "SELECT entry_id FROM entries WHERE conflict_key=? AND conflict_key!='' AND status!='archived'",
+                    (conflict_key,),
+                )
+                .fetchone()
+            )
+            if existing:
+                return f"✅ 该规则已存在: {existing['entry_id'][:12]}, 无需重复添加"
+
+            try:
+                entry = self.store.save_entry(
+                    {
+                        "scope_type": scope_value,
+                        "scope_key": scope_key,
+                        "kind": kind_value,
+                        "content": content,
+                        "triggers": trigger_values,
+                        "conflict_key": conflict_key,
+                        "status": "active",
+                        "trust_level": "owner_explicit",
+                        "confidence": 1.0,
+                        "evidence_count": 1,
+                        "evidence_ids": [evidence["row_id"]],
+                        "expires_at": expires_at,
+                        "priority": 100,
+                    },
+                    actor_key="owner_explicit_fast",
+                )
+
+                self._refresh_snapshot()
+                self.store.audit(
+                    f"llm_tool_fast:{platform}:user:{sender}",
+                    "save_entry_fast",
+                    "entry",
+                    entry["entry_id"],
+                    {"trust": "owner_explicit", "scope": scope_value},
+                )
+
+                expire_hint = f", {expires_days} 天后过期" if expires_days > 0 else ""
+                return f"✅ 主人的明确指令已立即生效: {entry['entry_id'][:12]}{expire_hint}"
+            except Exception as exc:
+                logger.exception("[%s] fast path entry creation failed", PLUGIN_NAME)
+                return f"快速通道写入失败: {exc}, 将走审核流程"
+
+        # 原有审核流程
         if not is_owner and scope_value in {
             ScopeType.GLOBAL.value,
             ScopeType.OWNER.value,
@@ -790,6 +877,14 @@ class GrowthMemory(Star):
         evidence = await self._tool_evidence_row(event, target_id)
         if not evidence:
             return "当前消息证据还未落账, 本次没有保存候选, 请稍后再试."
+
+        # 🆕 计算过期时间
+        expires_at = None
+        if expires_days > 0:
+            expires_at = (
+                datetime.now(timezone.utc) + timedelta(days=expires_days)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
         proposal = {
             "scope_type": scope_value,
             "scope_key": scope_key,
@@ -802,6 +897,7 @@ class GrowthMemory(Star):
             "conflict_key": self.pipeline._automatic_conflict_key(
                 scope_value, scope_key, kind_value, content, ""
             ),
+            "expires_at": expires_at,
         }
         candidate_key = json.dumps(
             {
@@ -829,7 +925,8 @@ class GrowthMemory(Star):
         )
         if row.get("_duplicate") or row["status"] in {"committed", "rejected"}:
             return f"这条记忆候选之前已经处理过, 当前状态: {row['status']}."
-        return f"已记录为待审核记忆候选 {candidate_id[:12]}, 将在下一次学习批次交给 Reviewer 筛选, 尚未写入正式记忆."
+        expire_hint = f", 设定 {expires_days} 天后过期" if expires_days > 0 else ""
+        return f"已记录为待审核记忆候选 {candidate_id[:12]}, 将在下一次学习批次交给 Reviewer 筛选, 尚未写入正式记忆{expire_hint}."
 
     @filter.on_llm_request(priority=10**9)
     async def on_llm_request(self, event: Any, req: Any) -> None:

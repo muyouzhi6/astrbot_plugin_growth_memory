@@ -1539,19 +1539,22 @@ class PluginRuntimeTests(unittest.TestCase):
                     triggers="画图",
                     confidence=0.9,
                 )
-                self.assertIn("待审核记忆候选", first)
-                self.assertIn("之前已经处理过", second)
+                # 主人 + 强意图 + behavior_rule + task scope 走快速通道
+                self.assertIn("立即生效", first)
+                self.assertIn("已存在", second)  # 第二次调用检测到重复
+                # 快速通道直接写入 entries 表，不写 candidates
+                self.assertEqual(
+                    plugin.store._db()
+                    .execute("SELECT COUNT(*) FROM entries WHERE scope_type='task'")
+                    .fetchone()[0],
+                    1,
+                )
+                # 不产生 candidate
                 self.assertEqual(
                     plugin.store._db()
                     .execute("SELECT COUNT(*) FROM candidates")
                     .fetchone()[0],
-                    1,
-                )
-                self.assertEqual(
-                    plugin.store._db()
-                    .execute("SELECT COUNT(*) FROM candidate_evidence")
-                    .fetchone()[0],
-                    1,
+                    0,
                 )
 
                 group = plugin.store.upsert_target(

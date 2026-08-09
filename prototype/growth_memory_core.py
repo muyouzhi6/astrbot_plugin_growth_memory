@@ -25,6 +25,7 @@ class EntryKind(str, Enum):
     BEHAVIOR_RULE = "behavior_rule"
     PROFILE_FACT = "profile_fact"
     MILESTONE = "milestone"
+    EMOTIONAL_BOND = "emotional_bond"  # 短期情感记忆，支持过期
 
 
 class EntryStatus(str, Enum):
