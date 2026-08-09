@@ -1257,6 +1257,29 @@ class PluginRuntimeTests(unittest.TestCase):
                 for tool in astrbot_filter.llm_tool.__globals__["llm_tools"].func_list
             ],
         )
+        tool_schema = next(
+            tool
+            for tool in astrbot_filter.llm_tool.__globals__["llm_tools"].func_list
+            if tool.name == "growth_memory_note"
+        )
+        self.assertEqual(
+            tool_schema.parameters["properties"]["triggers"],
+            {
+                "type": "string",
+                "description": "task 层级触发词, 多个触发词用逗号或换行分隔, 其他层级可留空.",
+            },
+        )
+        openai_schema = next(
+            item["function"]
+            for item in astrbot_filter.llm_tool.__globals__[
+                "llm_tools"
+            ].get_func_desc_openai_style()
+            if item["function"]["name"] == "growth_memory_note"
+        )
+        self.assertEqual(
+            openai_schema["parameters"]["properties"]["triggers"]["type"],
+            "string",
+        )
 
         async def run():
             with tempfile.TemporaryDirectory() as td:
@@ -1294,7 +1317,7 @@ class PluginRuntimeTests(unittest.TestCase):
                     note="以后画图不要偏黄",
                     scope="task",
                     kind="behavior_rule",
-                    triggers=["画图"],
+                    triggers="画图",
                     confidence=0.9,
                 )
                 second = await plugin.growth_memory_note(
@@ -1302,7 +1325,7 @@ class PluginRuntimeTests(unittest.TestCase):
                     note="以后画图不要偏黄",
                     scope="task",
                     kind="behavior_rule",
-                    triggers=["画图"],
+                    triggers="画图",
                     confidence=0.9,
                 )
                 self.assertIn("待审核记忆候选", first)

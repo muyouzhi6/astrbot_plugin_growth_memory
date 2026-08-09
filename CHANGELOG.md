@@ -1,5 +1,10 @@
 # 变更记录
 
+## v0.3.1
+
+- 修复 `growth_memory_note` 在 AstrBot 4.27.1 / Gemini 兼容 Provider 中生成无 `items` 的数组 schema, 导致上游返回 400 后整轮消息无回复.
+- 将 LLM 工具的触发词参数改为兼容所有支持版本的逗号/换行分隔字符串, 服务端仍规范化为内部字符串数组并保留 Python 直接调用的列表兼容性.
+
 ## v0.3.0
 
 - 新增 `growth_memory_note` AstrBot LLM tool. LLM 只能提交带当前入站消息证据的候选, 由 Reviewer 审核后才进入正式记忆.

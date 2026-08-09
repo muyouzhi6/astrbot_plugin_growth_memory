@@ -49,6 +49,17 @@
 
 ## 京东云基础部署证据
 
+2026-08-09 已将 `v0.3.1` 兼容修复部署到 `/opt/1panel/apps/astrbot/astrbot/data/plugins/astrbot_plugin_growth_memory`.
+
+- 根因证据: 2026-08-09 09:07:43 AstrBot 4.27.1 的 NewAPI 请求因 `properties[triggers].items: missing field` 返回 `400`, 错误来自 `growth_memory_note` 的数组参数 schema.
+- 变更前备份: `/opt/1panel/apps/astrbot/astrbot/data/backups/astrbot_plugin_growth_memory/20260809-091641-v0.3.1-predeploy/`, 含旧插件、配置和 SQLite `db/wal/shm`.
+- 发布包 SHA-256: `63b8439ac4448eed37b8aba00dfc4043e741adc634e86db467cdf2065a7e6c95`.
+- `astrbot` 仅重启一次, NapCat 未重启; 启动日志确认加载 `v0.3.1`, 作者 `木有知`, 注册 `growth_memory_note`, 初始化恢复 `learning_targets=5`, `entries=8`, `learning_runs=8`, `learning_batches=21`.
+- SQLite 重启后 `PRAGMA integrity_check=ok`, `journal_mode=wal`, `candidates=0`; `owner_identities=["aiocqhttp:1215198344"]`, `llm_note_enabled=true` 保留.
+- 认证 native OneBot `send_private_msg` 返回 `retcode=0`, `message_id=1707079192`; NapCat 容器仍为 `running`, `RestartCount=0`, `OOMKilled=false`.
+- 修复后的工具参数声明为跨版本兼容的 `string`, 多个触发词由逗号/换行分隔, 服务端继续规范化为内部字符串数组.
+- 真实 QQ 闭环: 09:23:09 私聊入站 `测试回复`, 09:23:10 SiliconFlow embedding `200`, 09:23:18 NewAPI chat completion `200`, NapCat 随后记录 `发送 -> 私聊 (1215198344) 测什么呢` 和 `我正喝冰美式呢`.
+
 2026-08-08 已将 GitHub `main` 的 `72550388c707851b55bbf764dc18be1d6b2268d7` 部署到 `/opt/1panel/apps/astrbot/astrbot/data/plugins/astrbot_plugin_growth_memory`, 当前为 `v0.3.0`.
 
 - 变更前备份: `/opt/1panel/apps/astrbot/astrbot/data/backups/astrbot_plugin_growth_memory/20260808-233856-v0.3.0-predeploy/`, 含旧插件、配置和 SQLite 在线备份.
@@ -74,6 +85,8 @@
 - [x] 执行一次真实 Extractor + Reviewer run, 核对 provider 请求数和 token 预算.
 - [ ] 在下一轮聊天检查条目实际注入并确认没有泄露 `behavior_only` 内容.
 - [x] 部署 `v0.3.0` 后重启 AstrBot, 验证 target、runtime flags、Provider、条目、SQLite 完整性和 `growth_memory_note` registry 均恢复.
+- [x] 部署 `v0.3.1` 后确认 `growth_memory_note` 注册成功, 不再生成无 `items` 的数组参数声明, 并完成 native OneBot 出站发送探针.
+- [x] 在 `v0.3.1` 部署后完成真实 QQ 入站 -> LLM 成功请求 -> AstrBot/OneBot 出站回复闭环.
 - [ ] 连续运行 24 小时, 检查 event loop latency, queue depth, WAL 大小, memory, provider 错误和 QQ 收发.
 
 当前状态为“已部署并完成真实学习/reload 验证”; 真实 QQ `/进化` 路径和 24 小时 soak 尚未冒充完成, 仍需按上表持续观察.

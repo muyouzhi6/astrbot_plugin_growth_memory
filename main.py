@@ -667,7 +667,7 @@ class GrowthMemory(Star):
         scope: str = "owner",
         kind: str = "profile_fact",
         subject_id: str = "",
-        triggers: list[str] | None = None,
+        triggers: str | list[str] | None = None,
         confidence: float = 0.8,
     ) -> str:
         """提交一条需要审核的长期记忆候选, 不会直接修改正式记忆.
@@ -679,7 +679,7 @@ class GrowthMemory(Star):
             scope(string): 记忆层级, 只能是 owner, global, task, group, person.
             kind(string): 条目类型, 只能是 behavior_rule, profile_fact, milestone.
             subject_id(string): person 层级对应的 QQ 号, 留空表示当前说话的人.
-            triggers(array): task 层级的触发词列表, 其他层级可留空.
+            triggers(string): task 层级触发词, 多个触发词用逗号或换行分隔, 其他层级可留空.
             confidence(number): 对候选内容的初始置信度, 0 到 1.
         """
         if not bool(self.config.get("llm_note_enabled", True)):
@@ -708,13 +708,18 @@ class GrowthMemory(Star):
             ):
                 raise ValueError("global scope only accepts behavior_rule")
             if triggers is None:
-                triggers = []
-            if not isinstance(triggers, list) or any(
-                not isinstance(value, str) for value in triggers
+                trigger_items = []
+            elif isinstance(triggers, str):
+                trigger_items = re.split(r"[,，\n\r]+", triggers)
+            elif isinstance(triggers, list) and all(
+                isinstance(value, str) for value in triggers
             ):
-                raise ValueError("triggers must be an array of strings")
+                # Keep direct Python callers and older tests compatible.
+                trigger_items = triggers
+            else:
+                raise ValueError("triggers must be a comma-separated string")
             trigger_values = [
-                value.strip()[:64] for value in triggers[:20] if value.strip()
+                value.strip()[:64] for value in trigger_items[:20] if value.strip()
             ]
             confidence_value = float(confidence)
             if not math.isfinite(confidence_value):
