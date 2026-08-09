@@ -802,7 +802,7 @@ class GrowthMemory(Star):
                 .fetchone()
             )
             if existing:
-                return f"✅ 该规则已存在: {existing['entry_id'][:12]}, 无需重复添加"
+                return "已记住"
 
             try:
                 entry = self.store.save_entry(
@@ -833,11 +833,11 @@ class GrowthMemory(Star):
                     {"trust": "owner_explicit", "scope": scope_value},
                 )
 
-                expire_hint = f", {expires_days} 天后过期" if expires_days > 0 else ""
-                return f"✅ 主人的明确指令已立即生效: {entry['entry_id'][:12]}{expire_hint}"
+                expire_hint = f" ({expires_days}天后过期)" if expires_days > 0 else ""
+                return f"已记住{expire_hint}"
             except Exception as exc:
                 logger.exception("[%s] fast path entry creation failed", PLUGIN_NAME)
-                return f"快速通道写入失败: {exc}, 将走审核流程"
+                return f"写入失败: {exc}"
 
         # 原有审核流程
         if not is_owner and scope_value in {
