@@ -10,8 +10,9 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .maintenance import MaintenancePipeline
 from .prototype.growth_memory_core import (
     CaptureAdmission,
     CaptureEnvelope,
@@ -293,6 +294,16 @@ class LearningPipeline:
             "AND b.status='running' AND b.lease_until>?)",
             (stamp, stamp),
         )
+        db.execute(
+            "UPDATE maintenance_queue SET status='deferred',run_id=NULL,updated_at=? "
+            "WHERE status='running'",
+            (stamp,),
+        )
+        db.execute(
+            "UPDATE maintenance_runs SET status='deferred',completed_at=?,updated_at=? "
+            "WHERE status='running'",
+            (stamp, stamp),
+        )
         db.commit()
         self._running = True
         self._ticker = asyncio.create_task(
@@ -332,7 +343,13 @@ class LearningPipeline:
             local = (now or datetime.now(ZoneInfo("Asia/Shanghai"))).astimezone(
                 ZoneInfo("Asia/Shanghai")
             )
-            result = {"scheduled": 0, "processed": 0, "deferred": 0}
+            result = {
+                "scheduled": 0,
+                "processed": 0,
+                "deferred": 0,
+                "maintenance_scheduled": 0,
+                "maintenance_processed": 0,
+            }
             today = local.date().isoformat()
             if time.monotonic() - self._last_anchor_cleanup_at >= 300:
                 cutoff = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime(
@@ -376,6 +393,17 @@ class LearningPipeline:
                 value = await self._process_run(run["run_id"], run["cutoff_at"])
                 result["processed"] += value["processed"]
                 result["deferred"] += value["deferred"]
+            if not force:
+                for slot_key in self._maintenance_due_slots(local):
+                    maintenance = await self._run_maintenance_slot(
+                        slot_key, "scheduled"
+                    )
+                    if maintenance is None:
+                        continue
+                    result["maintenance_scheduled"] += 1
+                    result["maintenance_processed"] += int(
+                        maintenance.get("processed", 0)
+                    )
             if result["processed"] and not result["deferred"]:
                 self.last_error = ""
             return result
@@ -387,15 +415,17 @@ class LearningPipeline:
                 continue
             try:
                 schedule_zone = ZoneInfo(str(schedule["timezone"]))
-            except Exception:
+                schedule_local = local.astimezone(schedule_zone)
+                hour, minute = (
+                    int(value) for value in str(schedule["local_time"]).split(":")
+                )
+                if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                    raise ValueError("schedule time is out of range")
+            except (TypeError, ValueError, ZoneInfoNotFoundError):
                 self.last_error = (
                     f"invalid schedule timezone: {schedule.get('timezone')}"
                 )
                 continue
-            schedule_local = local.astimezone(schedule_zone)
-            hour, minute = (
-                int(value) for value in str(schedule["local_time"]).split(":")
-            )
             slot_time = schedule_local.replace(
                 hour=hour, minute=minute, second=0, microsecond=0
             )
@@ -410,7 +440,106 @@ class LearningPipeline:
             )
             run_kind = "scheduled" if age < timedelta(minutes=1) else "catch_up"
             due.append((slot_key, run_kind))
+
         return due
+
+    def _maintenance_due_slots(self, local: datetime) -> list[str]:
+        """Return maintenance slots one hour after each enabled learning slot.
+
+        Args:
+            local: Current time used for deterministic scheduling.
+
+        Returns:
+            Unique catch-up-capable maintenance slot keys.
+        """
+        due: set[str] = set()
+        for schedule in self.store.schedules():
+            if not schedule.get("enabled"):
+                continue
+            try:
+                schedule_zone = ZoneInfo(str(schedule["timezone"]))
+                schedule_local = local.astimezone(schedule_zone)
+                hour, minute = (
+                    int(value) for value in str(schedule["local_time"]).split(":")
+                )
+            except (TypeError, ValueError, ZoneInfoNotFoundError):
+                continue
+            maintenance_time = schedule_local.replace(
+                hour=hour, minute=minute, second=0, microsecond=0
+            ) + timedelta(hours=1)
+            if maintenance_time > schedule_local:
+                maintenance_time -= timedelta(days=1)
+            if schedule_local - maintenance_time > timedelta(hours=12):
+                continue
+            due.add(
+                f"{maintenance_time.date().isoformat()}@{schedule['timezone']}@maintenance@"
+                f"{maintenance_time.strftime('%H:%M')}"
+            )
+        return sorted(due)
+
+    async def run_maintenance(self) -> dict[str, Any]:
+        """Run one manually requested maintenance pass.
+
+        Returns:
+            The maintenance report exposed by the dashboard API.
+        """
+        async with self.lock:
+            result = await self._run_maintenance_slot(
+                f"manual:{uuid.uuid4()}", "manual"
+            )
+            assert result is not None
+            return result
+
+    async def _run_maintenance_slot(
+        self, slot_key: str, run_type: str
+    ) -> dict[str, Any] | None:
+        """Create and execute one idempotent maintenance slot."""
+        run = self.store.create_maintenance_run(run_type, slot_key)
+        if run is None:
+            return None
+        run_id = str(run["run_id"])
+        provider = self._provider("reviewer_provider_id") or self._provider(
+            "extractor_provider_id"
+        )
+        caller = (
+            (
+                lambda prompt, system, current_run_id: self._call_json(
+                    provider, prompt, system, current_run_id
+                )
+            )
+            if provider
+            else None
+        )
+        try:
+            report = await MaintenancePipeline(self.store, caller).run(run_id)
+            changed = int(report.get("processed", 0)) + int(report.get("archived", 0))
+            if changed:
+                self.snapshot_refresher()
+            if report.get("failed"):
+                status = "partial" if changed or report.get("ignored") else "failed"
+            elif report.get("deferred"):
+                status = "partial" if changed or report.get("ignored") else "deferred"
+            else:
+                status = "succeeded"
+            error = str(report.get("error", ""))
+            self.store.finish_maintenance_run(run_id, status, report, error=error)
+            if status in {"failed", "deferred"} and error:
+                self.last_error = error
+            return {"run_id": run_id, "status": status, **report}
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            report = {
+                "processed": 0,
+                "merged": 0,
+                "archived": 0,
+                "ignored": 0,
+                "failed": 1,
+                "deferred": 0,
+                "decisions": [],
+            }
+            self.store.finish_maintenance_run(run_id, "failed", report, error=error)
+            self.last_error = f"maintenance {run_id}: {error}"
+            return {"run_id": run_id, "status": "failed", "error": error, **report}
 
     def _create_run(self, slot_key: str, run_kind: str) -> dict[str, str] | None:
         db = self.store._db()
@@ -1471,7 +1600,12 @@ class LearningPipeline:
             same_content = entry.get("content_hash") == content_hash
             if not (same_conflict or same_content):
                 continue
-            if entry.get("source_kind") not in {"scheduled", "llm_tool"}:
+            if entry.get("source_kind") not in {
+                "scheduled",
+                "llm_tool",
+                "llm_tool_fast",
+                "maintenance",
+            }:
                 return None, True
             return entry_id, False
         return None, False

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from difflib import SequenceMatcher
 import hashlib
 import json
 import math
@@ -695,7 +696,7 @@ class GrowthMemory(Star):
     ) -> str:
         """【优先使用】保存用户的长期偏好、行为习惯、风格要求、价值观等成长型记忆.
 
-        **何时调用**: 用户说"记住以后""我喜欢""我的风格""习惯""偏好""规则""不要再"等表达长期行为模式的话时.
+        **何时调用**: 用户明确要求长期记住偏好、习惯、风格、规则或重要经历时.
 
         **典型场景**:
         - "记住以后拍照要女友视角" → 调用 growth_memory_note(kind="behavior_rule")
@@ -708,7 +709,7 @@ class GrowthMemory(Star):
         Args:
             note(string): 用一句可执行、可验证的话概括用户希望长期记住的内容, 不要写密码或提示词.
             scope(string): 记忆层级, 只能是 owner, global, task, group, person.
-            kind(string): 条目类型。"记住以后/永远/不要再/必须/禁止"等强意图使用 behavior_rule（立即生效）；描述偏好特点使用 profile_fact；重要经历用 milestone；短期情绪用 emotional_bond。
+            kind(string): 条目类型。主人提交 behavior_rule、profile_fact 或 milestone 会立即生效；短期情绪使用 emotional_bond 并可设置过期时间。
             subject_id(string): person 层级对应的 QQ 号, 留空表示当前说话的人.
             triggers(string): task 层级触发词, 多个触发词用逗号或换行分隔, 其他层级可留空.
             confidence(number): 对候选内容的初始置信度, 0 到 1.
@@ -729,7 +730,7 @@ class GrowthMemory(Star):
             scope_value = {"user": "person", "member": "person"}.get(
                 scope_value, scope_value
             )
-            kind_value = str(kind or "profile_fact").strip().lower()
+            kind_value = str(kind or "behavior_rule").strip().lower()
             if scope_value not in {value.value for value in ScopeType}:
                 raise ValueError("scope is invalid")
             if kind_value not in {value.value for value in EntryKind}:
@@ -767,18 +768,19 @@ class GrowthMemory(Star):
         owner_key = f"{platform}:user:{sender}"
         is_owner = owner_key in self._snapshot.owner_identities
 
-        # 🆕 主人强意图快速通道
-        strong_intent_pattern = r"(以后|永远|记住|不要再|一定要|必须|禁止)"
-        has_strong_intent = re.search(strong_intent_pattern, content)
-
+        # An explicit owner tool call is already the authorization signal. Do not
+        # depend on wording that the chat model may have summarized away.
         if (
             is_owner
-            and has_strong_intent
-            and kind_value == EntryKind.BEHAVIOR_RULE.value
+            and kind_value
+            in {
+                EntryKind.BEHAVIOR_RULE.value,
+                EntryKind.PROFILE_FACT.value,
+                EntryKind.MILESTONE.value,
+            }
             and scope_value
             in {ScopeType.OWNER.value, ScopeType.TASK.value, ScopeType.GLOBAL.value}
         ):
-            # 快速通道：跳过 Reviewer，立即生效
             if scope_value == ScopeType.TASK.value:
                 if not trigger_values:
                     return "task 层级至少需要一个触发词, 没有保存任何内容."
@@ -800,17 +802,115 @@ class GrowthMemory(Star):
                 scope_value, scope_key, kind_value, content, ""
             )
 
-            # 检查是否已存在相同冲突键的条目
-            existing = (
+            new_normalized = (
+                re.sub(r"[\W_]+", "", content.casefold()) or content.casefold()
+            )
+            rows = (
                 self.store._db()
                 .execute(
-                    "SELECT entry_id FROM entries WHERE conflict_key=? AND conflict_key!='' AND status!='archived'",
-                    (conflict_key,),
+                    "SELECT * FROM entries WHERE scope_type=? AND scope_key=? AND kind=? "
+                    "AND status!='archived' ORDER BY updated_at DESC",
+                    (scope_value, scope_key, kind_value),
                 )
-                .fetchone()
+                .fetchall()
             )
-            if existing:
-                return ""
+            best: Any = None
+            best_similarity = 0.0
+            for row in rows:
+                old_content = str(row["content"] or "")
+                old_normalized = (
+                    re.sub(r"[\W_]+", "", old_content.casefold())
+                    or old_content.casefold()
+                )
+                similarity = SequenceMatcher(
+                    None, old_normalized, new_normalized
+                ).ratio()
+                if old_normalized == new_normalized or new_normalized in old_normalized:
+                    best, best_similarity = row, 1.0
+                    break
+                if old_normalized in new_normalized:
+                    best, best_similarity = row, 1.0
+                    break
+                if similarity > best_similarity:
+                    best, best_similarity = row, similarity
+
+            if best is not None:
+                old_normalized = (
+                    re.sub(r"[\W_]+", "", str(best["content"]).casefold())
+                    or str(best["content"]).casefold()
+                )
+                if old_normalized == new_normalized or new_normalized in old_normalized:
+                    return ""
+                if best["source_kind"] == "manual":
+                    queued = self.store.mark_entry_for_maintenance(
+                        best["entry_id"], content, evidence["row_id"], priority=50
+                    )
+                    self.store.audit(
+                        f"llm_tool_fast:{platform}:user:{sender}",
+                        "queue_maintenance",
+                        "maintenance_queue",
+                        queued["queue_id"],
+                        {"entry_id": best["entry_id"], "manual_entry": True},
+                    )
+                    return ""
+                if old_normalized in new_normalized:
+                    try:
+                        old_dates = json.loads(best["evidence_dates_json"] or "[]")
+                    except (TypeError, ValueError):
+                        old_dates = []
+                    updated_dates = sorted(
+                        set(old_dates) | {str(evidence["occurred_at"])[:10]}
+                    )
+                    try:
+                        old_triggers = json.loads(best["triggers_json"] or "[]")
+                    except (TypeError, ValueError):
+                        old_triggers = []
+                    self.store.save_entry(
+                        {
+                            **dict(best),
+                            "entry_id": best["entry_id"],
+                            "content": content,
+                            "triggers": list(
+                                dict.fromkeys(old_triggers + trigger_values)
+                            ),
+                            "conflict_key": best["conflict_key"] or conflict_key,
+                            "status": "active",
+                            "trust_level": "owner_explicit",
+                            "confidence": 1.0,
+                            "evidence_count": max(1, int(best["evidence_count"]) + 1),
+                            "evidence_dates": updated_dates,
+                            "expires_at": expires_at,
+                            "source_kind": "llm_tool_fast",
+                            "visibility": (
+                                "behavior_only"
+                                if kind_value == EntryKind.BEHAVIOR_RULE.value
+                                else best["visibility"]
+                            ),
+                        },
+                        actor_key="owner_explicit_update",
+                        reason="owner content expansion",
+                    )
+                    self._refresh_snapshot()
+                    self.store.audit(
+                        f"llm_tool_fast:{platform}:user:{sender}",
+                        "update_entry_fast",
+                        "entry",
+                        best["entry_id"],
+                        {"reason": "content_expansion"},
+                    )
+                    return ""
+                if best_similarity >= 0.55:
+                    queued = self.store.mark_entry_for_maintenance(
+                        best["entry_id"], content, evidence["row_id"], priority=50
+                    )
+                    self.store.audit(
+                        f"llm_tool_fast:{platform}:user:{sender}",
+                        "queue_maintenance",
+                        "maintenance_queue",
+                        queued["queue_id"],
+                        {"entry_id": best["entry_id"], "similarity": best_similarity},
+                    )
+                    return ""
 
             try:
                 entry = self.store.save_entry(
@@ -825,9 +925,15 @@ class GrowthMemory(Star):
                         "trust_level": "owner_explicit",
                         "confidence": 1.0,
                         "evidence_count": 1,
-                        "evidence_ids": [evidence["row_id"]],
+                        "evidence_dates": [str(evidence["occurred_at"])[:10]],
                         "expires_at": expires_at,
                         "priority": 100,
+                        "source_kind": "llm_tool_fast",
+                        "visibility": (
+                            "behavior_only"
+                            if kind_value == EntryKind.BEHAVIOR_RULE.value
+                            else "public"
+                        ),
                     },
                     actor_key="owner_explicit_fast",
                 )
@@ -841,10 +947,7 @@ class GrowthMemory(Star):
                     {"trust": "owner_explicit", "scope": scope_value},
                 )
 
-                expire_hint = (
-                    f", {expires_days}天后自动清理" if expires_days > 0 else ""
-                )
-                return f"规则已保存{expire_hint}"
+                return ""
             except Exception as exc:
                 logger.exception("[%s] fast path entry creation failed", PLUGIN_NAME)
                 return f"保存失败: {exc}"
@@ -935,8 +1038,7 @@ class GrowthMemory(Star):
         )
         if row.get("_duplicate") or row["status"] in {"committed", "rejected"}:
             return ""
-        expire_hint = f", {expires_days}天后自动清理" if expires_days > 0 else ""
-        return f"候选已记录{expire_hint}"
+        return ""
 
     @filter.on_llm_request(priority=10**9)
     async def on_llm_request(self, event: Any, req: Any) -> None:
@@ -1171,6 +1273,13 @@ class GrowthMemory(Star):
             ("/astrbot_plugin_growth_memory/schedules/<schedule_id>", ["POST"]),
             ("/astrbot_plugin_growth_memory/runs", ["GET"]),
             ("/astrbot_plugin_growth_memory/run-now", ["POST"]),
+            ("/astrbot_plugin_growth_memory/maintenance/queue", ["GET"]),
+            (
+                "/astrbot_plugin_growth_memory/maintenance/queue/<queue_id>",
+                ["POST"],
+            ),
+            ("/astrbot_plugin_growth_memory/maintenance/runs", ["GET"]),
+            ("/astrbot_plugin_growth_memory/maintenance/run-now", ["POST"]),
             ("/astrbot_plugin_growth_memory/settings", ["GET", "POST"]),
         ]
         for route, methods in routes:
@@ -1382,7 +1491,11 @@ class GrowthMemory(Star):
                 )
                 self.store.audit(username, "upsert", "schedule", row["schedule_id"])
                 return json_response(row, status_code=201)
-            if path.endswith("/runs") and method == "GET":
+            if (
+                path.endswith("/runs")
+                and "/maintenance/" not in path
+                and method == "GET"
+            ):
                 return json_response(
                     [
                         dict(r)
@@ -1394,8 +1507,128 @@ class GrowthMemory(Star):
                     ]
                 )
             if path.endswith("/run-now") and method == "POST":
+                if "/maintenance/" in path:
+                    value = await self.pipeline.run_maintenance()
+                    return json_response(value, status_code=202)
                 value = await self.pipeline.run_due(force=True)
                 return json_response(value, status_code=202)
+            if "/maintenance/queue" in path:
+                queue_id = str(path_params.get("queue_id") or "")
+                if method == "GET" and not queue_id:
+                    return json_response(
+                        self.store.maintenance_queue(include_completed=True, limit=100)
+                    )
+                if method != "POST" or not queue_id:
+                    return error_response(
+                        "maintenance queue item not found", status_code=404
+                    )
+                body = await request.json(default={})
+                if not isinstance(body, dict):
+                    return error_response("JSON object required")
+                item = next(
+                    (
+                        row
+                        for row in self.store.maintenance_queue(
+                            include_completed=True, limit=500
+                        )
+                        if row["queue_id"] == queue_id
+                    ),
+                    None,
+                )
+                if not item:
+                    return error_response(
+                        "maintenance queue item not found", status_code=404
+                    )
+                action = str(body.get("action", "")).strip().lower()
+                if action == "retry":
+                    if not self.store.retry_maintenance_item(queue_id):
+                        return error_response(
+                            "maintenance item cannot be retried", status_code=409
+                        )
+                    self.store.audit(username, "retry", "maintenance_queue", queue_id)
+                    return json_response({"ok": True})
+                if item["status"] not in {"pending", "deferred", "failed"}:
+                    return error_response(
+                        "maintenance item is already resolved", status_code=409
+                    )
+                if action == "keep_existing":
+                    decision = {
+                        "action": "ignore",
+                        "reason": "kept existing content from dashboard",
+                        "actor": username,
+                    }
+                    if not self.store.resolve_maintenance_item(
+                        queue_id, "ignored", decision
+                    ):
+                        return error_response(
+                            "maintenance item is already resolved", status_code=409
+                        )
+                elif action == "apply_new":
+                    entry = (
+                        self.store._db()
+                        .execute(
+                            "SELECT * FROM entries WHERE entry_id=?",
+                            (item["entry_id"],),
+                        )
+                        .fetchone()
+                    )
+                    if not entry:
+                        return error_response("entry not found", status_code=404)
+                    data = dict(entry)
+                    try:
+                        data["triggers"] = json.loads(data.get("triggers_json") or "[]")
+                    except (TypeError, ValueError):
+                        data["triggers"] = []
+                    try:
+                        data["evidence_dates"] = json.loads(
+                            data.get("evidence_dates_json") or "[]"
+                        )
+                    except (TypeError, ValueError):
+                        data["evidence_dates"] = []
+                    data.update(
+                        {
+                            "content": item["conflicting_content"],
+                            "status": "active",
+                            "trust_level": "manual",
+                            "confidence": 1.0,
+                            "source_kind": "manual",
+                            "evidence_count": max(
+                                1, int(data.get("evidence_count", 0)) + 1
+                            ),
+                        }
+                    )
+                    saved = self.store.save_entry(
+                        data,
+                        actor_key=username,
+                        reason=f"dashboard accepted maintenance queue {queue_id}",
+                    )
+                    decision = {
+                        "action": "replace",
+                        "reason": "accepted proposed content from dashboard",
+                        "actor": username,
+                        "entry_id": saved["entry_id"],
+                    }
+                    if not self.store.resolve_maintenance_item(
+                        queue_id, "succeeded", decision
+                    ):
+                        return error_response(
+                            "maintenance item is already resolved", status_code=409
+                        )
+                    self._refresh_snapshot()
+                else:
+                    return error_response(
+                        "unsupported maintenance action", status_code=422
+                    )
+                self.store.audit(
+                    username,
+                    action,
+                    "maintenance_queue",
+                    queue_id,
+                    {"entry_id": item["entry_id"]},
+                )
+                return json_response({"ok": True})
+            if path.endswith("/maintenance/runs") and method == "GET":
+                return json_response(self.store.maintenance_runs(limit=50))
             if path.endswith("/settings"):
                 if method == "GET":
                     return json_response(

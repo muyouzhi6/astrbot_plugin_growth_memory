@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import astrbot_plugin_growth_memory.main as plugin_main
 from astrbot_plugin_growth_memory.main import GrowthMemory, TargetCaptureFilter
+from astrbot_plugin_growth_memory.maintenance import MaintenancePipeline
 from astrbot_plugin_growth_memory.prototype.growth_memory_core import (
     CaptureItemKind,
     LearningTarget,
@@ -344,6 +345,45 @@ class PluginRuntimeTests(unittest.TestCase):
             self.assertEqual(store.entries()[0]["content"], "偏好简洁回答")
             store.close()
 
+    def test_existing_maintenance_tables_receive_new_retry_and_report_columns(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "db.sqlite"
+            db = sqlite3.connect(db_path)
+            db.execute(
+                """CREATE TABLE maintenance_queue(
+                queue_id TEXT PRIMARY KEY, entry_id TEXT NOT NULL,
+                conflicting_content TEXT NOT NULL, conflicting_evidence_id TEXT,
+                priority INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending',
+                decision_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL)"""
+            )
+            db.execute(
+                """CREATE TABLE maintenance_runs(
+                run_id TEXT PRIMARY KEY, run_type TEXT NOT NULL, slot_key TEXT UNIQUE NOT NULL,
+                status TEXT NOT NULL, processed_count INTEGER NOT NULL DEFAULT 0,
+                merged_count INTEGER NOT NULL DEFAULT 0, archived_count INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT, completed_at TEXT, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL)"""
+            )
+            db.commit()
+            db.close()
+
+            store = GrowthStore(db_path)
+            store.open()
+            queue_columns = {
+                row[1]
+                for row in store._db().execute("PRAGMA table_info(maintenance_queue)")
+            }
+            run_columns = {
+                row[1]
+                for row in store._db().execute("PRAGMA table_info(maintenance_runs)")
+            }
+            self.assertTrue({"attempts", "run_id"} <= queue_columns)
+            self.assertTrue(
+                {"ignored_count", "failed_count", "report_json", "error"} <= run_columns
+            )
+            store.close()
+
     def test_stale_missing_anchors_are_cancelled(self):
         with tempfile.TemporaryDirectory() as td:
             store = GrowthStore(Path(td) / "db.sqlite")
@@ -626,7 +666,7 @@ class PluginRuntimeTests(unittest.TestCase):
                 await plugin.initialize()
                 self.assertIs(plugin.pipeline._ticker, ticker)
                 self.assertIs(plugin.writer._task, writer_task)
-                self.assertEqual(len(plugin.context.registered_web_apis), 13)
+                self.assertEqual(len(plugin.context.registered_web_apis), 17)
                 await plugin.terminate()
 
         asyncio.run(run())
@@ -702,7 +742,10 @@ class PluginRuntimeTests(unittest.TestCase):
         self.assertIn('id="toast"', html)
         self.assertIn('id="page-status"', html)
         self.assertIn('aria-live="polite"', html)
+        self.assertIn('id="maintenance-queue"', html)
+        self.assertIn('id="run-maintenance"', html)
         self.assertIn("function setBusy(active)", script)
+        self.assertIn('api("GET", "maintenance/runs")', script)
         self.assertIn("document.body.dataset.busy = String(busy)", script)
         self.assertIn("prefers-reduced-motion", style)
 
@@ -885,6 +928,9 @@ class PluginRuntimeTests(unittest.TestCase):
                 second = await pipeline.run_due(now=now)
                 self.assertEqual(first["scheduled"], 1)
                 self.assertEqual(second["scheduled"], 0)
+                self.assertEqual(first["maintenance_scheduled"], 1)
+                self.assertEqual(second["maintenance_scheduled"], 0)
+                self.assertEqual(len(store.maintenance_runs()), 1)
                 run_kind = (
                     store._db()
                     .execute("SELECT run_kind FROM learning_runs")
@@ -1539,9 +1585,9 @@ class PluginRuntimeTests(unittest.TestCase):
                     triggers="画图",
                     confidence=0.9,
                 )
-                # 主人 + 强意图 + behavior_rule + task scope 走快速通道
-                self.assertIn("规则已保存", first)
-                self.assertEqual("", second)  # 第二次调用检测到重复，返回空字符串
+                # Owner-authorized task rules activate immediately without a fixed reply.
+                self.assertEqual("", first)
+                self.assertEqual("", second)
                 # 快速通道直接写入 entries 表，不写 candidates
                 self.assertEqual(
                     plugin.store._db()
@@ -1681,6 +1727,289 @@ class PluginRuntimeTests(unittest.TestCase):
                 self.assertEqual(entry["source_kind"], "llm_tool")
                 self.assertEqual(entry["status"], "active")
                 self.assertEqual(entry["content"], "以后画图不要偏黄")
+
+        asyncio.run(run())
+
+    def test_owner_profile_fact_expands_then_queues_ambiguous_change(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as td:
+                plugin = GrowthMemory(
+                    FakeContext(),
+                    {
+                        "capture_enabled": True,
+                        "llm_note_enabled": True,
+                        "owner_identities": ["aiocqhttp:user:10001"],
+                    },
+                )
+                plugin.store = GrowthStore(Path(td) / "db.sqlite")
+                plugin.store.open()
+                plugin.store.upsert_target(
+                    {
+                        "platform": "aiocqhttp",
+                        "chat_type": "private",
+                        "peer_id": "10001",
+                    }
+                )
+                plugin._refresh_snapshot()
+                first = await plugin.growth_memory_note(
+                    FakeEvent(
+                        text="我喜欢自然真实的拍照",
+                        sender="10001",
+                        message_id="profile-1",
+                    ),
+                    note="我喜欢自然真实的拍照",
+                    kind="profile_fact",
+                )
+                expanded = await plugin.growth_memory_note(
+                    FakeEvent(
+                        text="我喜欢自然真实的拍照，不要复古滤镜",
+                        sender="10001",
+                        message_id="profile-2",
+                    ),
+                    note="我喜欢自然真实的拍照，不要复古滤镜",
+                    kind="profile_fact",
+                )
+                ambiguous = await plugin.growth_memory_note(
+                    FakeEvent(
+                        text="我喜欢自然真实的拍照，可以使用暖黄滤镜",
+                        sender="10001",
+                        message_id="profile-3",
+                    ),
+                    note="我喜欢自然真实的拍照，可以使用暖黄滤镜",
+                    kind="profile_fact",
+                )
+                self.assertEqual((first, expanded, ambiguous), ("", "", ""))
+                entries = plugin.store.entries()
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0]["status"], "active")
+                self.assertEqual(entries[0]["version"], 2)
+                self.assertIn("不要复古滤镜", entries[0]["content"])
+                queue = plugin.store.maintenance_queue()
+                self.assertEqual(len(queue), 1)
+                self.assertEqual(queue[0]["entry_id"], entries[0]["entry_id"])
+
+        asyncio.run(run())
+
+    def test_owner_tool_does_not_automatically_overwrite_manual_entry(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as td:
+                plugin = GrowthMemory(
+                    FakeContext(),
+                    {
+                        "capture_enabled": True,
+                        "llm_note_enabled": True,
+                        "owner_identities": ["aiocqhttp:user:10001"],
+                    },
+                )
+                plugin.store = GrowthStore(Path(td) / "db.sqlite")
+                plugin.store.open()
+                plugin.store.upsert_target(
+                    {
+                        "platform": "aiocqhttp",
+                        "chat_type": "private",
+                        "peer_id": "10001",
+                    }
+                )
+                manual = plugin.store.save_entry(
+                    {
+                        "scope_type": "owner",
+                        "kind": "milestone",
+                        "content": "项目采用稳定发布流程",
+                        "status": "active",
+                        "trust_level": "manual",
+                        "source_kind": "manual",
+                    }
+                )
+                plugin._refresh_snapshot()
+                result = await plugin.growth_memory_note(
+                    FakeEvent(
+                        text="项目采用稳定发布流程, 每次发布前必须做回滚演练",
+                        sender="10001",
+                        message_id="manual-protected-1",
+                    ),
+                    note="项目采用稳定发布流程, 每次发布前必须做回滚演练",
+                    kind="milestone",
+                )
+                self.assertEqual(result, "")
+                current = plugin.store.entries()[0]
+                self.assertEqual(current["entry_id"], manual["entry_id"])
+                self.assertEqual(current["version"], 1)
+                self.assertEqual(current["content"], "项目采用稳定发布流程")
+                queue = plugin.store.maintenance_queue()
+                self.assertEqual(len(queue), 1)
+                self.assertEqual(queue[0]["entry_id"], manual["entry_id"])
+
+        asyncio.run(run())
+
+    def test_maintenance_queue_merge_is_versioned_and_reported(self):
+        async def decide(_prompt, _system, _run_id):
+            return [
+                {
+                    "action": "merge",
+                    "reason": "owner update adds a constraint",
+                    "merged_content": "拍照保持自然真实，不要复古滤镜",
+                }
+            ]
+
+        async def run():
+            with tempfile.TemporaryDirectory() as td:
+                store = GrowthStore(Path(td) / "db.sqlite")
+                store.open()
+                entry = store.save_entry(
+                    {
+                        "scope_type": "owner",
+                        "kind": "profile_fact",
+                        "content": "拍照保持自然真实",
+                        "status": "active",
+                        "trust_level": "owner_explicit",
+                        "source_kind": "llm_tool_fast",
+                    }
+                )
+                queued = store.mark_entry_for_maintenance(
+                    entry["entry_id"], "拍照不要复古滤镜"
+                )
+                maintenance_run = store.create_maintenance_run(
+                    "manual", "manual:test-queue"
+                )
+                report = await MaintenancePipeline(store, decide).run(
+                    maintenance_run["run_id"]
+                )
+                store.finish_maintenance_run(
+                    maintenance_run["run_id"], "succeeded", report
+                )
+                updated = store.entries()[0]
+                self.assertEqual(updated["version"], 2)
+                self.assertEqual(updated["content"], "拍照保持自然真实，不要复古滤镜")
+                self.assertEqual(report["processed"], 1)
+                self.assertEqual(report["merged"], 1)
+                queue = store.maintenance_queue(include_completed=True)
+                self.assertEqual(queue[0]["queue_id"], queued["queue_id"])
+                self.assertEqual(queue[0]["status"], "succeeded")
+                self.assertEqual(store.maintenance_runs()[0]["merged_count"], 1)
+
+        asyncio.run(run())
+
+    def test_similarity_maintenance_archives_through_entry_versions(self):
+        async def decide(_prompt, _system, _run_id):
+            return [
+                {
+                    "action": "merge",
+                    "reason": "same preference",
+                    "merged_content": "拍照保持自然真实，不要黄调",
+                }
+            ]
+
+        async def run():
+            with tempfile.TemporaryDirectory() as td:
+                store = GrowthStore(Path(td) / "db.sqlite")
+                store.open()
+                first = store.save_entry(
+                    {
+                        "scope_type": "owner",
+                        "kind": "profile_fact",
+                        "content": "拍照保持自然真实",
+                        "status": "active",
+                        "trust_level": "owner_explicit",
+                        "source_kind": "llm_tool_fast",
+                    }
+                )
+                second = store.save_entry(
+                    {
+                        "scope_type": "owner",
+                        "kind": "profile_fact",
+                        "content": "拍照保持自然真实，不要黄调",
+                        "status": "active",
+                        "trust_level": "owner_explicit",
+                        "source_kind": "llm_tool_fast",
+                    }
+                )
+                run_row = store.create_maintenance_run("manual", "manual:test-pairs")
+                report = await MaintenancePipeline(store, decide).run(run_row["run_id"])
+                rows = {
+                    row["entry_id"]: row for row in store.entries(include_archived=True)
+                }
+                self.assertEqual(report["archived"], 1)
+                self.assertEqual(
+                    sorted(row["status"] for row in rows.values()),
+                    ["active", "archived"],
+                )
+                archived_id = next(
+                    entry_id
+                    for entry_id, row in rows.items()
+                    if row["status"] == "archived"
+                )
+                self.assertEqual(len(store.entry_versions(archived_id)), 2)
+                self.assertIn(archived_id, {first["entry_id"], second["entry_id"]})
+
+        asyncio.run(run())
+
+    def test_similarity_maintenance_skips_empty_normalized_text(self):
+        async def decide(_prompt, _system, _run_id):
+            self.fail("punctuation-only entries must not reach the LLM")
+
+        async def run():
+            with tempfile.TemporaryDirectory() as td:
+                store = GrowthStore(Path(td) / "db.sqlite")
+                store.open()
+                for content in ("!!!", "???"):
+                    store.save_entry(
+                        {
+                            "scope_type": "owner",
+                            "kind": "profile_fact",
+                            "content": content,
+                            "status": "active",
+                            "trust_level": "owner_explicit",
+                            "source_kind": "llm_tool_fast",
+                        }
+                    )
+                run_row = store.create_maintenance_run(
+                    "manual", "manual:test-empty-pairs"
+                )
+                report = await MaintenancePipeline(store, decide).run(run_row["run_id"])
+                self.assertEqual(report["similar_pairs"], 0)
+
+        asyncio.run(run())
+
+    def test_web_api_can_resolve_maintenance_queue(self):
+        async def run():
+            original_request = plugin_main.request
+            try:
+                with tempfile.TemporaryDirectory() as td:
+                    plugin = GrowthMemory(FakeContext(), {})
+                    plugin.store = GrowthStore(Path(td) / "db.sqlite")
+                    plugin.store.open()
+                    entry = plugin.store.save_entry(
+                        {
+                            "scope_type": "owner",
+                            "kind": "profile_fact",
+                            "content": "偏好简短回复",
+                            "status": "active",
+                            "trust_level": "owner_explicit",
+                            "source_kind": "llm_tool_fast",
+                        }
+                    )
+                    queue = plugin.store.mark_entry_for_maintenance(
+                        entry["entry_id"], "偏好详细回复"
+                    )
+                    plugin_main.request = FakeWebRequest(
+                        "POST",
+                        "/api/plug/astrbot_plugin_growth_memory/maintenance/queue/"
+                        + queue["queue_id"],
+                        {"action": "apply_new"},
+                    )
+                    response = await plugin.web_api(queue_id=queue["queue_id"])
+                    self.assertEqual(response_data(response), {"ok": True})
+                    updated = plugin.store.entries()[0]
+                    self.assertEqual(updated["content"], "偏好详细回复")
+                    self.assertEqual(updated["source_kind"], "manual")
+                    self.assertEqual(
+                        plugin.store.maintenance_queue(include_completed=True)[0][
+                            "status"
+                        ],
+                        "succeeded",
+                    )
+            finally:
+                plugin_main.request = original_request
 
         asyncio.run(run())
 

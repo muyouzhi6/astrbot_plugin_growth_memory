@@ -57,7 +57,7 @@
         <div class="panel-heading"><div><p class="kicker">CONTROL PLANE</p><h2>运行设置</h2></div><span class="hint">写入 SQLite, reload 保留</span></div>
         <form id="settings-form" class="settings-grid">
           <label class="switch-row"><input name="capture_enabled" type="checkbox" /><span><b>全局捕获开关</b><small>关闭后立即停止采集, 已有记忆仍会注入</small></span></label>
-          <label class="switch-row"><input name="llm_note_enabled" type="checkbox" /><span><b>允许 LLM 主动记候选</b><small>只进入 Reviewer 队列, 不会直接修改正式记忆</small></span></label>
+          <label class="switch-row"><input name="llm_note_enabled" type="checkbox" /><span><b>允许 LLM 主动记忆</b><small>主人提交规则、偏好或经历立即生效, 其他内容进入 Reviewer</small></span></label>
           <label class="wide">主人身份 <span class="muted">每行一个 aiocqhttp:QQ号</span><textarea name="owner_identities" rows="2" placeholder="aiocqhttp:123456789"></textarea></label>
           <label>Extractor 总结 Provider<select name="extractor_provider_id"><option value="">不启用自动提取</option></select></label>
           <label>Reviewer 审查 Provider<select name="reviewer_provider_id"><option value="">留空复用 Extractor</option></select></label>
@@ -74,6 +74,14 @@
       <section class="panel runs-panel">
         <div class="panel-heading"><div><p class="kicker">AUDIT TRAIL</p><h2>最近运行</h2></div><span class="hint">保留最近 50 次</span></div>
         <div id="runs" class="table-wrap"></div>
+      </section>
+
+      <section class="panel maintenance-panel">
+        <div class="panel-heading maintenance-heading"><div><p class="kicker">MEMORY HYGIENE</p><h2>记忆维护</h2><p class="muted">学习后 1 小时自动处理相似或冲突条目, 每次修改都保留版本.</p></div><button id="run-maintenance" class="secondary">立即维护</button></div>
+        <div class="maintenance-grid">
+          <div><h3>待处理与历史决策</h3><div id="maintenance-queue" class="maintenance-list"></div></div>
+          <div><h3>维护运行</h3><div id="maintenance-runs" class="table-wrap"></div></div>
+        </div>
       </section>
 
       <section class="panel entries-panel">

@@ -108,6 +108,18 @@ CREATE TABLE IF NOT EXISTS runtime_flags(key TEXT PRIMARY KEY,value_json TEXT NO
 CREATE TABLE IF NOT EXISTS injection_audit(audit_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,entry_ids_json TEXT NOT NULL,estimated_tokens INTEGER NOT NULL,created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_injection_audit_time ON injection_audit(created_at);
 CREATE TABLE IF NOT EXISTS audit_log(audit_id TEXT PRIMARY KEY,actor_key TEXT NOT NULL,action TEXT NOT NULL,object_type TEXT NOT NULL,object_id TEXT NOT NULL,payload_json TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS maintenance_queue(
+ queue_id TEXT PRIMARY KEY, entry_id TEXT NOT NULL, conflicting_content TEXT NOT NULL,
+ conflicting_evidence_id TEXT, priority INTEGER NOT NULL DEFAULT 0,
+ status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+ run_id TEXT, decision_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_maintenance_queue_status ON maintenance_queue(status,priority DESC,created_at);
+CREATE TABLE IF NOT EXISTS maintenance_runs(
+ run_id TEXT PRIMARY KEY, run_type TEXT NOT NULL, slot_key TEXT UNIQUE NOT NULL,
+ status TEXT NOT NULL, processed_count INTEGER NOT NULL DEFAULT 0, merged_count INTEGER NOT NULL DEFAULT 0,
+ archived_count INTEGER NOT NULL DEFAULT 0, ignored_count INTEGER NOT NULL DEFAULT 0,
+ failed_count INTEGER NOT NULL DEFAULT 0, report_json TEXT NOT NULL DEFAULT '{}',
+ error TEXT NOT NULL DEFAULT '', started_at TEXT, completed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 """
 
 
@@ -161,6 +173,36 @@ class GrowthStore:
             if name not in candidate_columns:
                 self.conn.execute(
                     f"ALTER TABLE candidates ADD COLUMN {name} {definition}"
+                )
+        maintenance_queue_columns = {
+            str(row[1])
+            for row in self.conn.execute(
+                "PRAGMA table_info(maintenance_queue)"
+            ).fetchall()
+        }
+        for name, definition in (
+            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("run_id", "TEXT"),
+        ):
+            if name not in maintenance_queue_columns:
+                self.conn.execute(
+                    f"ALTER TABLE maintenance_queue ADD COLUMN {name} {definition}"
+                )
+        maintenance_run_columns = {
+            str(row[1])
+            for row in self.conn.execute(
+                "PRAGMA table_info(maintenance_runs)"
+            ).fetchall()
+        }
+        for name, definition in (
+            ("ignored_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("failed_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("report_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("error", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in maintenance_run_columns:
+                self.conn.execute(
+                    f"ALTER TABLE maintenance_runs ADD COLUMN {name} {definition}"
                 )
         self.conn.commit()
 
@@ -689,7 +731,12 @@ class GrowthStore:
         visibility = str(data.get("visibility", "public"))
         if scope_type not in {"global", "owner", "task", "group", "person"}:
             raise ValueError("invalid scope_type")
-        if kind not in {"behavior_rule", "profile_fact", "milestone"}:
+        if kind not in {
+            "behavior_rule",
+            "profile_fact",
+            "milestone",
+            "emotional_bond",
+        }:
             raise ValueError("invalid kind")
         if status not in {"draft", "trial", "active", "suspended", "archived"}:
             raise ValueError("invalid status")
@@ -877,6 +924,46 @@ class GrowthStore:
         db.commit()
         return int(cursor.rowcount)
 
+    def archive_entry(self, entry_id: str, reason: str = "") -> dict[str, Any]:
+        """Archive an entry through the versioned mutation path.
+
+        Args:
+            entry_id: Entry to archive.
+            reason: Audit reason for the archive.
+
+        Returns:
+            The archived entry row.
+
+        Raises:
+            ValueError: If the entry does not exist.
+        """
+        row = (
+            self._db()
+            .execute("SELECT * FROM entries WHERE entry_id=?", (entry_id,))
+            .fetchone()
+        )
+        if not row:
+            raise ValueError("entry not found")
+        data = dict(row)
+        try:
+            data["triggers"] = json.loads(data.get("triggers_json") or "[]")
+        except (TypeError, ValueError):
+            data["triggers"] = []
+        try:
+            data["evidence_dates"] = json.loads(data.get("evidence_dates_json") or "[]")
+        except (TypeError, ValueError):
+            data["evidence_dates"] = []
+        data["status"] = "archived"
+        result = self.save_entry(
+            data,
+            actor_key="maintenance",
+            reason=reason or "maintenance archive",
+        )
+        self.audit(
+            "maintenance", "archive_entry", "entry", entry_id, {"reason": reason}
+        )
+        return result
+
     def archive_stale_drafts(self, cutoff: str) -> int:
         db = self._db()
         cursor = db.execute(
@@ -1031,18 +1118,360 @@ class GrowthStore:
     ) -> None:
         db = self._db()
         db.execute(
-            "INSERT INTO audit_log(audit_id,actor_key,action,object_type,object_id,payload_json,created_at) VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO audit_log(audit_id,actor_key,action,object_type,object_id,payload_json,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
             (
                 str(uuid.uuid4()),
-                actor,
-                action,
-                object_type,
-                object_id,
+                str(actor)[:500],
+                str(action)[:200],
+                str(object_type)[:100],
+                str(object_id)[:500],
                 json.dumps(payload or {}, ensure_ascii=False),
                 now_iso(),
             ),
         )
         db.commit()
+
+    def mark_entry_for_maintenance(
+        self,
+        entry_id: str,
+        conflicting_content: str,
+        conflicting_evidence_id: str | None = None,
+        priority: int = 0,
+    ) -> dict[str, Any]:
+        """Queue an ambiguous owner update for cold-path maintenance.
+
+        Args:
+            entry_id: Existing entry that may need to be changed.
+            conflicting_content: Newly submitted owner content.
+            conflicting_evidence_id: Message row supporting the new content.
+            priority: Queue priority from -100 to 100.
+
+        Returns:
+            The created or existing queue row with a duplicate marker.
+
+        Raises:
+            ValueError: If the entry or proposed content is invalid.
+        """
+        content = str(conflicting_content).strip()[:4000]
+        if not content:
+            raise ValueError("maintenance content must not be empty")
+        with self._lock:
+            db = self._db()
+            if not db.execute(
+                "SELECT 1 FROM entries WHERE entry_id=? AND status!='archived'",
+                (entry_id,),
+            ).fetchone():
+                raise ValueError("maintenance entry not found")
+            existing = db.execute(
+                "SELECT * FROM maintenance_queue WHERE entry_id=? AND conflicting_content=? "
+                "AND status IN ('pending','deferred','running','ignored') ORDER BY created_at LIMIT 1",
+                (entry_id, content),
+            ).fetchone()
+            if existing:
+                result = dict(existing)
+                result["_duplicate"] = True
+                return result
+            queue_id = str(uuid.uuid4())
+            stamp = now_iso()
+            db.execute(
+                "INSERT INTO maintenance_queue(queue_id,entry_id,conflicting_content,"
+                "conflicting_evidence_id,priority,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    queue_id,
+                    entry_id,
+                    content,
+                    conflicting_evidence_id,
+                    max(-100, min(100, int(priority))),
+                    "pending",
+                    stamp,
+                    stamp,
+                ),
+            )
+            db.commit()
+            result = dict(
+                db.execute(
+                    "SELECT * FROM maintenance_queue WHERE queue_id=?", (queue_id,)
+                ).fetchone()
+            )
+            result["_duplicate"] = False
+            return result
+
+    def maintenance_queue(
+        self, *, include_completed: bool = False, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Return maintenance items together with their current entry.
+
+        Args:
+            include_completed: Include resolved and failed items.
+            limit: Maximum number of rows to return.
+
+        Returns:
+            Queue rows ordered by priority and creation time.
+        """
+        where = (
+            ""
+            if include_completed
+            else "WHERE q.status IN ('pending','deferred','running')"
+        )
+        return [
+            dict(row)
+            for row in self._db()
+            .execute(
+                "SELECT q.*,e.content AS existing_content,e.scope_type,e.scope_key,e.kind "
+                "FROM maintenance_queue q JOIN entries e ON e.entry_id=q.entry_id "
+                f"{where} ORDER BY q.priority DESC,q.created_at DESC LIMIT ?",
+                (max(1, min(500, int(limit))),),
+            )
+            .fetchall()
+        ]
+
+    def claim_maintenance_queue(
+        self, run_id: str, *, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Claim retryable maintenance items for one run.
+
+        Args:
+            run_id: Maintenance run identifier.
+            limit: Maximum items to claim.
+
+        Returns:
+            Claimed queue rows joined to the current entries.
+        """
+        with self._lock:
+            db = self._db()
+            rows = db.execute(
+                "SELECT queue_id FROM maintenance_queue WHERE status IN ('pending','deferred') "
+                "AND attempts<3 ORDER BY priority DESC,created_at LIMIT ?",
+                (max(1, min(100, int(limit))),),
+            ).fetchall()
+            if not rows:
+                return []
+            queue_ids = [str(row["queue_id"]) for row in rows]
+            stamp = now_iso()
+            db.executemany(
+                "UPDATE maintenance_queue SET status='running',attempts=attempts+1,run_id=?,updated_at=? "
+                "WHERE queue_id=? AND status IN ('pending','deferred')",
+                [(run_id, stamp, queue_id) for queue_id in queue_ids],
+            )
+            db.commit()
+            placeholders = ",".join("?" for _ in queue_ids)
+            return [
+                dict(row)
+                for row in db.execute(
+                    "SELECT q.*,e.content AS existing_content,e.scope_type,e.scope_key,e.kind "
+                    "FROM maintenance_queue q JOIN entries e ON e.entry_id=q.entry_id "
+                    f"WHERE q.queue_id IN ({placeholders}) AND q.run_id=? AND q.status='running' "
+                    "ORDER BY q.priority DESC,q.created_at",
+                    (*queue_ids, run_id),
+                ).fetchall()
+            ]
+
+    def finish_maintenance_item(
+        self,
+        queue_id: str,
+        run_id: str,
+        status: str,
+        decision: dict[str, Any],
+    ) -> bool:
+        """Finish a claimed maintenance item with compare-and-set semantics.
+
+        Args:
+            queue_id: Queue item identifier.
+            run_id: Run that claimed the item.
+            status: Final or retry status.
+            decision: Validated decision or error payload.
+
+        Returns:
+            Whether the claimed row was updated.
+
+        Raises:
+            ValueError: If the requested status is unsupported.
+        """
+        if status not in {"succeeded", "ignored", "deferred", "failed"}:
+            raise ValueError("invalid maintenance item status")
+        db = self._db()
+        updated = db.execute(
+            "UPDATE maintenance_queue SET status=?,decision_json=?,updated_at=? "
+            "WHERE queue_id=? AND run_id=? AND status='running'",
+            (
+                status,
+                json.dumps(decision, ensure_ascii=False),
+                now_iso(),
+                queue_id,
+                run_id,
+            ),
+        ).rowcount
+        db.commit()
+        return bool(updated)
+
+    def resolve_maintenance_item(
+        self, queue_id: str, status: str, decision: dict[str, Any]
+    ) -> bool:
+        """Resolve a non-running queue item from the dashboard.
+
+        Args:
+            queue_id: Queue item identifier.
+            status: succeeded or ignored.
+            decision: Manual decision payload for audit display.
+
+        Returns:
+            Whether the item was resolved.
+
+        Raises:
+            ValueError: If the final status is unsupported.
+        """
+        if status not in {"succeeded", "ignored"}:
+            raise ValueError("invalid manual maintenance status")
+        db = self._db()
+        updated = db.execute(
+            "UPDATE maintenance_queue SET status=?,decision_json=?,run_id=NULL,updated_at=? "
+            "WHERE queue_id=? AND status IN ('pending','deferred','failed')",
+            (
+                status,
+                json.dumps(decision, ensure_ascii=False),
+                now_iso(),
+                queue_id,
+            ),
+        ).rowcount
+        db.commit()
+        return bool(updated)
+
+    def retry_maintenance_item(self, queue_id: str) -> bool:
+        """Return a failed or deferred dashboard item to the pending queue.
+
+        Args:
+            queue_id: Queue item identifier.
+
+        Returns:
+            Whether the item was made pending.
+        """
+        db = self._db()
+        updated = db.execute(
+            "UPDATE maintenance_queue SET status='pending',attempts=0,run_id=NULL,"
+            "decision_json='{}',updated_at=? WHERE queue_id=? "
+            "AND status IN ('deferred','failed')",
+            (now_iso(), queue_id),
+        ).rowcount
+        db.commit()
+        return bool(updated)
+
+    def create_maintenance_run(
+        self, run_type: str, slot_key: str
+    ) -> dict[str, Any] | None:
+        """Create an idempotent scheduled or manual maintenance run.
+
+        Args:
+            run_type: Either scheduled or manual.
+            slot_key: Unique schedule slot or manual request key.
+
+        Returns:
+            The new running row, or None when the slot already exists.
+
+        Raises:
+            ValueError: If the run type is invalid.
+        """
+        if run_type not in {"scheduled", "manual"}:
+            raise ValueError("invalid maintenance run type")
+        run_id = str(uuid.uuid4())
+        stamp = now_iso()
+        db = self._db()
+        inserted = db.execute(
+            "INSERT OR IGNORE INTO maintenance_runs(run_id,run_type,slot_key,status,started_at,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (run_id, run_type, slot_key, "running", stamp, stamp, stamp),
+        ).rowcount
+        db.commit()
+        if not inserted:
+            return None
+        return dict(
+            db.execute(
+                "SELECT * FROM maintenance_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+        )
+
+    def finish_maintenance_run(
+        self,
+        run_id: str,
+        status: str,
+        report: dict[str, Any],
+        *,
+        error: str = "",
+    ) -> None:
+        """Persist the final maintenance report.
+
+        Args:
+            run_id: Maintenance run identifier.
+            status: succeeded, partial, deferred, or failed.
+            report: Aggregate counters and decision details.
+            error: Short operational error, if any.
+
+        Raises:
+            ValueError: If the status is unsupported.
+        """
+        if status not in {"succeeded", "partial", "deferred", "failed"}:
+            raise ValueError("invalid maintenance run status")
+        db = self._db()
+        db.execute(
+            "UPDATE maintenance_runs SET status=?,processed_count=?,merged_count=?,"
+            "archived_count=?,ignored_count=?,failed_count=?,report_json=?,error=?,"
+            "completed_at=?,updated_at=? WHERE run_id=? AND status='running'",
+            (
+                status,
+                int(report.get("processed", 0)),
+                int(report.get("merged", 0)),
+                int(report.get("archived", 0)),
+                int(report.get("ignored", 0)),
+                int(report.get("failed", 0)),
+                json.dumps(report, ensure_ascii=False),
+                str(error)[:500],
+                now_iso(),
+                now_iso(),
+                run_id,
+            ),
+        )
+        db.commit()
+
+    def maintenance_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Return recent maintenance reports.
+
+        Args:
+            limit: Maximum number of runs to return.
+
+        Returns:
+            Recent runs ordered newest first.
+        """
+        return [
+            dict(row)
+            for row in self._db()
+            .execute(
+                "SELECT * FROM maintenance_runs ORDER BY created_at DESC LIMIT ?",
+                (max(1, min(200, int(limit))),),
+            )
+            .fetchall()
+        ]
+
+    def maintenance_entries(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return active automatic entries eligible for similarity maintenance.
+
+        Args:
+            limit: Maximum entries to inspect.
+
+        Returns:
+            Full entry rows ordered by most recently updated.
+        """
+        return [
+            dict(row)
+            for row in self._db()
+            .execute(
+                "SELECT * FROM entries WHERE status IN ('active','trial') "
+                "AND source_kind IN ('llm_tool_fast','llm_tool','scheduled','maintenance') "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (max(1, min(300, int(limit))),),
+            )
+            .fetchall()
+        ]
 
     def runtime_flags(self) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -1109,6 +1538,8 @@ class GrowthStore:
                 "learning_runs",
                 "learning_batches",
                 "injection_audit",
+                "maintenance_queue",
+                "maintenance_runs",
             )
         }
         counts["pending_anchors"] = int(
@@ -1118,4 +1549,9 @@ class GrowthStore:
             ).fetchone()[0]
         )
         counts["pending_tool_candidates"] = self.pending_tool_candidate_count()
+        counts["pending_maintenance"] = int(
+            db.execute(
+                "SELECT COUNT(*) FROM maintenance_queue WHERE status IN ('pending','deferred','running')"
+            ).fetchone()[0]
+        )
         return counts

@@ -1,11 +1,11 @@
 const bridge = window.AstrBotPluginPage;
 const $ = (id) => document.getElementById(id);
-const state = { entries: [], schedules: [], settings: {}, providers: [], pendingRequests: 0 };
+const state = { entries: [], schedules: [], settings: {}, providers: [], maintenanceQueue: [], maintenanceRuns: [], pendingRequests: 0 };
 
 const labels = {
   active: "生效", trial: "试用", draft: "草稿", suspended: "暂停", archived: "归档",
   succeeded: "成功", running: "运行中", deferred: "待重试", failed: "失败", partial: "部分完成",
-  scheduled: "定时", catch_up: "补跑", manual: "手动",
+  pending: "待处理", ignored: "已忽略", scheduled: "定时", catch_up: "补跑", manual: "手动",
 };
 
 function escapeHtml(value) {
@@ -63,6 +63,7 @@ function renderMetrics(data) {
     ["原始消息", counts.conversation_messages || 0, "保留 14 天"],
     ["待处理 anchor", counts.pending_anchors ?? counts.trigger_anchors ?? 0, "问答证据"],
     ["待审核候选", counts.pending_tool_candidates || 0, "LLM 主动记忆"],
+    ["待维护条目", counts.pending_maintenance || 0, "冲突与相似项"],
     ["记忆条目", counts.entries || 0, "按层级注入"],
     ["有效注入", counts.injection_audit || 0, "保留 90 天审计"],
     ["学习运行", counts.learning_runs || 0, "含失败和补跑"],
@@ -92,6 +93,31 @@ function renderSchedules(rows) {
 function renderRuns(rows) {
   if (!rows.length) { $("runs").innerHTML = '<p class="empty">还没有学习运行记录.</p>'; return; }
   $("runs").innerHTML = `<table><thead><tr><th scope="col">时间</th><th scope="col">类型</th><th scope="col">状态</th><th scope="col">请求</th><th scope="col">输入 Token</th><th scope="col">输出 Token</th><th scope="col">完成</th></tr></thead><tbody>${rows.map((row) => `<tr><td>${escapeHtml(formatTime(row.created_at))}</td><td>${escapeHtml(labels[row.run_kind] || row.run_kind)}</td><td class="status-${escapeHtml(row.status)}">${escapeHtml(labels[row.status] || row.status)}</td><td>${escapeHtml(row.request_count)}</td><td>${escapeHtml(row.input_tokens_estimated)}</td><td>${escapeHtml(row.output_tokens_actual)}</td><td>${escapeHtml(formatTime(row.completed_at))}</td></tr>`).join("")}</tbody></table>`;
+}
+
+function decisionOf(row) {
+  try { return JSON.parse(row.decision_json || "{}"); } catch { return {}; }
+}
+
+function reportOf(row) {
+  try { return JSON.parse(row.report_json || "{}"); } catch { return {}; }
+}
+
+function renderMaintenanceQueue(rows) {
+  state.maintenanceQueue = rows;
+  const visible = rows.slice(0, 40);
+  $("maintenance-queue").innerHTML = visible.length ? visible.map((row) => {
+    const decision = decisionOf(row);
+    const actionable = ["pending", "deferred", "failed"].includes(row.status);
+    const retry = ["deferred", "failed"].includes(row.status);
+    return `<article class="maintenance-item"><div class="maintenance-item-head"><strong>${escapeHtml(row.kind)} · ${escapeHtml(row.scope_type)}</strong><span class="tag status-${escapeHtml(row.status)}">${escapeHtml(labels[row.status] || row.status)}</span></div><div class="memory-compare"><div><span>现有</span><p>${escapeHtml(row.existing_content)}</p></div><div><span>新提交</span><p>${escapeHtml(row.conflicting_content)}</p></div></div>${decision.reason ? `<p class="decision-note">${escapeHtml(decision.reason)}</p>` : ""}${actionable ? `<div class="entry-actions"><button class="minor maintenance-keep" data-id="${escapeHtml(row.queue_id)}">保留现有</button><button class="minor maintenance-apply" data-id="${escapeHtml(row.queue_id)}">采用新内容</button>${retry ? `<button class="minor maintenance-retry" data-id="${escapeHtml(row.queue_id)}">重新排队</button>` : ""}</div>` : ""}</article>`;
+  }).join("") : '<p class="empty">没有维护队列记录.</p>';
+}
+
+function renderMaintenanceRuns(rows) {
+  state.maintenanceRuns = rows;
+  if (!rows.length) { $("maintenance-runs").innerHTML = '<p class="empty">还没有维护运行记录.</p>'; return; }
+  $("maintenance-runs").innerHTML = `<table class="maintenance-table"><thead><tr><th scope="col">时间</th><th scope="col">类型</th><th scope="col">状态</th><th scope="col">处理</th><th scope="col">合并</th><th scope="col">忽略</th></tr></thead><tbody>${rows.map((row) => { const report = reportOf(row); return `<tr title="${escapeHtml(row.error || "")}"><td>${escapeHtml(formatTime(row.created_at))}</td><td>${escapeHtml(labels[row.run_type] || row.run_type)}</td><td class="status-${escapeHtml(row.status)}">${escapeHtml(labels[row.status] || row.status)}</td><td>${escapeHtml(row.processed_count || 0)}</td><td>${escapeHtml(row.merged_count || 0)}</td><td>${escapeHtml(row.ignored_count || report.ignored || 0)}</td></tr>`; }).join("")}</tbody></table>`;
 }
 
 function triggersOf(row) {
@@ -135,7 +161,7 @@ function fillSettings(settings) {
 }
 
 async function load() {
-  const [dashboard, settings, entries, runs, providers] = await Promise.all([api("GET", "state"), api("GET", "settings"), api("GET", "entries"), api("GET", "runs"), api("GET", "providers")]);
+  const [dashboard, settings, entries, runs, providers, maintenanceQueue, maintenanceRuns] = await Promise.all([api("GET", "state"), api("GET", "settings"), api("GET", "entries"), api("GET", "runs"), api("GET", "providers"), api("GET", "maintenance/queue"), api("GET", "maintenance/runs")]);
   state.entries = entries || [];
   state.providers = providers || [];
   fillSettings(settings);
@@ -143,6 +169,8 @@ async function load() {
   renderTargets(dashboard.targets || []);
   renderSchedules(dashboard.schedules || []);
   renderRuns(runs || []);
+  renderMaintenanceQueue(maintenanceQueue || []);
+  renderMaintenanceRuns(maintenanceRuns || []);
   renderEntries();
 }
 
@@ -213,6 +241,14 @@ $("settings-form").addEventListener("submit", async (event) => {
 $("run-now").addEventListener("click", async () => {
   try { const result = await api("POST", "run-now", {}); showToast(`学习任务已提交, 处理 ${result.processed || 0} 个 anchor`); await load(); } catch (error) { showToast(String(error), true); }
 });
+$("run-maintenance").addEventListener("click", async () => {
+  try {
+    const result = await api("POST", "maintenance/run-now", {});
+    const summary = result.status === "deferred" ? "维护已延后, 请检查 Reviewer Provider" : `处理 ${result.processed || 0} 条, 合并 ${result.merged || 0} 条`;
+    showToast(summary, result.status === "failed");
+    await load();
+  } catch (error) { showToast(String(error), true); }
+});
 $("refresh").addEventListener("click", () => load().then(() => showToast("已刷新")).catch((error) => showToast(String(error), true)));
 $("entry-search").addEventListener("input", renderEntries);
 $("entry-scope").addEventListener("change", renderEntries);
@@ -267,6 +303,20 @@ $("entries").addEventListener("click", async (event) => {
     const row = state.entries.find((item) => item.entry_id === rollback.dataset.id);
     if (row) openRollback(row).catch((error) => showToast(String(error), true));
   }
+});
+
+$("maintenance-queue").addEventListener("click", async (event) => {
+  const keep = event.target.closest(".maintenance-keep");
+  const apply = event.target.closest(".maintenance-apply");
+  const retry = event.target.closest(".maintenance-retry");
+  const button = keep || apply || retry;
+  if (!button) return;
+  const action = keep ? "keep_existing" : apply ? "apply_new" : "retry";
+  try {
+    await api("POST", `maintenance/queue/${button.dataset.id}`, { action });
+    showToast(keep ? "已保留现有记忆" : apply ? "已采用新内容" : "已重新排队");
+    await load();
+  } catch (error) { showToast(String(error), true); }
 });
 
 $("entry-form").addEventListener("submit", async (event) => {
