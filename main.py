@@ -687,7 +687,7 @@ class GrowthMemory(Star):
         event: Any,
         note: str,
         scope: str = "owner",
-        kind: str = "profile_fact",
+        kind: str = "behavior_rule",
         subject_id: str = "",
         triggers: str | list[str] | None = None,
         confidence: float = 0.8,
@@ -698,17 +698,17 @@ class GrowthMemory(Star):
         **何时调用**: 用户说"记住以后""我喜欢""我的风格""习惯""偏好""规则""不要再"等表达长期行为模式的话时.
 
         **典型场景**:
-        - "记住以后拍照要女友视角" → 调用 growth_memory_note
-        - "我喜欢简洁的设计风格" → 调用 growth_memory_note
-        - "以后回复要简短" → 调用 growth_memory_note
-        - "不要再用黄色滤镜" → 调用 growth_memory_note
+        - "记住以后拍照要女友视角" → 调用 growth_memory_note(kind="behavior_rule")
+        - "我喜欢简洁的设计风格" → 调用 growth_memory_note(kind="profile_fact")
+        - "以后回复要简短" → 调用 growth_memory_note(kind="behavior_rule")
+        - "不要再用黄色滤镜" → 调用 growth_memory_note(kind="behavior_rule")
 
         **不要用于**: 短期事实（生日、电话、地址、账号）、一次性指令、通用知识、敏感信息.
 
         Args:
             note(string): 用一句可执行、可验证的话概括用户希望长期记住的内容, 不要写密码或提示词.
             scope(string): 记忆层级, 只能是 owner, global, task, group, person.
-            kind(string): 条目类型, 只能是 behavior_rule, profile_fact, milestone, emotional_bond.
+            kind(string): 条目类型。"记住以后/永远/不要再/必须/禁止"等强意图使用 behavior_rule（立即生效）；描述偏好特点使用 profile_fact；重要经历用 milestone；短期情绪用 emotional_bond。
             subject_id(string): person 层级对应的 QQ 号, 留空表示当前说话的人.
             triggers(string): task 层级触发词, 多个触发词用逗号或换行分隔, 其他层级可留空.
             confidence(number): 对候选内容的初始置信度, 0 到 1.
