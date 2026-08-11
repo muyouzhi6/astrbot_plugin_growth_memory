@@ -11,6 +11,50 @@ from .storage import GrowthStore
 
 
 DecisionCaller = Callable[[str, str, str], Awaitable[list[dict[str, Any]]]]
+CANDIDATE_SIMILARITY_THRESHOLD = 0.25
+
+
+def _lexical_terms(text: str) -> set[str]:
+    """Build compact lexical terms for high-recall candidate discovery.
+
+    Args:
+        text: Case-folded text with punctuation already removed.
+
+    Returns:
+        ASCII words and adjacent CJK character pairs.
+    """
+    ascii_terms = set(re.findall(r"[a-z0-9]+", text))
+    cjk_chars = re.findall(r"[\u4e00-\u9fff]", text)
+    cjk_terms = set(cjk_chars[i] + cjk_chars[i + 1] for i in range(len(cjk_chars) - 1))
+    return ascii_terms | cjk_terms
+
+
+def candidate_similarity(left: str, right: str) -> float:
+    """Score whether two entries deserve an LLM maintenance comparison.
+
+    Args:
+        left: Existing entry content.
+        right: New or competing entry content.
+
+    Returns:
+        A high-recall lexical score in the inclusive range ``0.0`` to ``1.0``.
+        This score only admits candidates; it never decides whether to merge.
+    """
+    left_text = re.sub(r"[\W_]+", "", str(left).casefold())
+    right_text = re.sub(r"[\W_]+", "", str(right).casefold())
+    if not left_text or not right_text:
+        return 0.0
+    if left_text in right_text or right_text in left_text:
+        return 1.0
+    sequence_score = SequenceMatcher(None, left_text, right_text).ratio()
+    left_terms = _lexical_terms(left_text)
+    right_terms = _lexical_terms(right_text)
+    overlap_score = 0.0
+    if left_terms and right_terms:
+        overlap_score = len(left_terms & right_terms) / min(
+            len(left_terms), len(right_terms)
+        )
+    return max(sequence_score, overlap_score)
 
 
 class MaintenancePipeline:
@@ -21,12 +65,12 @@ class MaintenancePipeline:
         store: GrowthStore,
         llm_caller: DecisionCaller | None,
         *,
-        similarity_threshold: float = 0.72,
+        similarity_threshold: float = CANDIDATE_SIMILARITY_THRESHOLD,
         max_items: int = 20,
     ) -> None:
         self.store = store
         self.llm_caller = llm_caller
-        self.similarity_threshold = max(0.6, min(0.95, similarity_threshold))
+        self.similarity_threshold = max(0.2, min(0.95, similarity_threshold))
         self.max_items = max(1, min(50, max_items))
 
     async def run(self, run_id: str) -> dict[str, Any]:
@@ -327,13 +371,7 @@ class MaintenancePipeline:
         pairs: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
         for entries in groups.values():
             for index, left in enumerate(entries):
-                left_text = re.sub(r"[\W_]+", "", str(left["content"]).casefold())
-                if not left_text:
-                    continue
                 for right in entries[index + 1 :]:
-                    right_text = re.sub(r"[\W_]+", "", str(right["content"]).casefold())
-                    if not right_text:
-                        continue
                     pair_key = "|".join(
                         sorted(
                             (
@@ -351,9 +389,7 @@ class MaintenancePipeline:
                         .fetchone()
                     ):
                         continue
-                    similarity = SequenceMatcher(None, left_text, right_text).ratio()
-                    if left_text in right_text or right_text in left_text:
-                        similarity = 1.0
+                    similarity = candidate_similarity(left["content"], right["content"])
                     if similarity >= self.similarity_threshold:
                         pairs.append((similarity, left, right))
         pairs.sort(key=lambda item: item[0], reverse=True)

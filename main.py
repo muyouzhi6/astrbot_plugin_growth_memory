@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from difflib import SequenceMatcher
 import hashlib
 import json
 import math
@@ -23,6 +22,7 @@ from .runtime import (
     normalize_text,
     render_injection,
 )
+from .maintenance import CANDIDATE_SIMILARITY_THRESHOLD, candidate_similarity
 from .storage import GrowthStore, now_iso
 from .prototype.growth_memory_core import (
     CaptureItemKind,
@@ -822,9 +822,7 @@ class GrowthMemory(Star):
                     re.sub(r"[\W_]+", "", old_content.casefold())
                     or old_content.casefold()
                 )
-                similarity = SequenceMatcher(
-                    None, old_normalized, new_normalized
-                ).ratio()
+                similarity = candidate_similarity(old_content, content)
                 if old_normalized == new_normalized or new_normalized in old_normalized:
                     best, best_similarity = row, 1.0
                     break
@@ -899,7 +897,7 @@ class GrowthMemory(Star):
                         {"reason": "content_expansion"},
                     )
                     return ""
-                if best_similarity >= 0.55:
+                if best_similarity >= CANDIDATE_SIMILARITY_THRESHOLD:
                     queued = self.store.mark_entry_for_maintenance(
                         best["entry_id"], content, evidence["row_id"], priority=50
                     )

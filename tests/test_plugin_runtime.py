@@ -1790,6 +1790,47 @@ class PluginRuntimeTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_owner_semantic_rephrase_is_queued_instead_of_creating_duplicate(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as td:
+                plugin = GrowthMemory(
+                    FakeContext(),
+                    {
+                        "capture_enabled": True,
+                        "llm_note_enabled": True,
+                        "owner_identities": ["aiocqhttp:user:10001"],
+                    },
+                )
+                plugin.store = GrowthStore(Path(td) / "db.sqlite")
+                plugin.store.open()
+                plugin.store.upsert_target(
+                    {
+                        "platform": "aiocqhttp",
+                        "chat_type": "private",
+                        "peer_id": "10001",
+                    }
+                )
+                plugin._refresh_snapshot()
+                first = "拍照时要采用不同景别、不同角度、不同姿势，女友视角，日常感拉满，避免黄色调滤镜。"
+                second = "拍照要女友视角，日常自然真实，iPhone原相机直出感，不要黄调滤镜，随手抓拍感，支持怼脸与多角度pose景别"
+                await plugin.growth_memory_note(
+                    FakeEvent(text=first, sender="10001", message_id="rephrase-1"),
+                    note=first,
+                    kind="behavior_rule",
+                )
+                result = await plugin.growth_memory_note(
+                    FakeEvent(text=second, sender="10001", message_id="rephrase-2"),
+                    note=second,
+                    kind="behavior_rule",
+                )
+                self.assertEqual(result, "")
+                self.assertEqual(len(plugin.store.entries()), 1)
+                queue = plugin.store.maintenance_queue()
+                self.assertEqual(len(queue), 1)
+                self.assertEqual(queue[0]["conflicting_content"], second)
+
+        asyncio.run(run())
+
     def test_owner_tool_does_not_automatically_overwrite_manual_entry(self):
         async def run():
             with tempfile.TemporaryDirectory() as td:
@@ -1940,6 +1981,44 @@ class PluginRuntimeTests(unittest.TestCase):
                 )
                 self.assertEqual(len(store.entry_versions(archived_id)), 2)
                 self.assertIn(archived_id, {first["entry_id"], second["entry_id"]})
+
+        asyncio.run(run())
+
+    def test_similarity_maintenance_calls_llm_for_low_surface_similarity(self):
+        calls = []
+
+        async def decide(_prompt, _system, _run_id):
+            calls.append(True)
+            return [
+                {
+                    "action": "ignore",
+                    "reason": "LLM decides whether the pair is distinct",
+                }
+            ]
+
+        async def run():
+            with tempfile.TemporaryDirectory() as td:
+                store = GrowthStore(Path(td) / "db.sqlite")
+                store.open()
+                for content in (
+                    "拍照时要采用不同景别、不同角度、不同姿势，女友视角，日常感拉满，避免黄色调滤镜。",
+                    "拍照要女友视角，日常自然真实，iPhone原相机直出感，不要黄调滤镜，随手抓拍感，支持怼脸与多角度pose景别",
+                ):
+                    store.save_entry(
+                        {
+                            "scope_type": "owner",
+                            "kind": "behavior_rule",
+                            "content": content,
+                            "status": "active",
+                            "trust_level": "owner_explicit",
+                            "source_kind": "llm_tool_fast",
+                        }
+                    )
+                run_row = store.create_maintenance_run("manual", "manual:low-surface")
+                report = await MaintenancePipeline(store, decide).run(run_row["run_id"])
+                self.assertEqual(report["similar_pairs"], 1)
+                self.assertEqual(report["ignored"], 1)
+                self.assertEqual(len(calls), 1)
 
         asyncio.run(run())
 
